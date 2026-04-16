@@ -9,6 +9,8 @@ add_subdirectory(DiscreteMaskAccessConversion)
 add_subdirectory(TritonToUnstructure)
 add_subdirectory(TritonToLLVM)
 add_subdirectory(TritonToStructured)
+add_subdirectory(DynamicCVPipeline)
+# todo: this code will be removed in version 530.
 add_subdirectory(TritonAffinityOpt)
 
 if(TRITON_ENABLE_COVERAGE_HITEST)
