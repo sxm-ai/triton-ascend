@@ -366,6 +366,10 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
       pm.addPass(mlir::triton::createAddDynamicCVPipelinePass(opts));
     });
 
+  m.def("add_add_if_controls", [](mlir::PassManager &pm) {
+      pm.addPass(mlir::triton::createAddIfControlsPass());
+    });
+
   // todo: this code will be removed in version 530.
   m.def("add_dag_sync", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createDAGSyncPass());});

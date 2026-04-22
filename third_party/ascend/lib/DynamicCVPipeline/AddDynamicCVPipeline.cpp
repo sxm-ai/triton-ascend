@@ -56,6 +56,7 @@ void AddDynamicCVPipelinePass::runOnOperation()
     PassManager pm(&getContext(), moduleOp.getOperationName());
 
     // todo: add related passes.
+    pm.addPass(mlir::triton::createAddIfControlsPass());
 
     if (failed(runPipeline(pm, getOperation()))) {
         moduleOp->emitError("[AddDynamicCVPipeline] pass failed!");

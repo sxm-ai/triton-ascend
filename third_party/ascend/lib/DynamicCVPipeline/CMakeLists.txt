@@ -1,5 +1,9 @@
 add_triton_library(DynamicCVPipeline
   AddDynamicCVPipeline.cpp
+  AddIfControls.cpp
+  LifecycleAnalysis.cpp
+  InnerMultibuffer.cpp
+  OuterMultiBuffer.cpp
 
   DEPENDS
   AddDynamicCVPipelinePassIncGen
@@ -7,4 +11,10 @@ add_triton_library(DynamicCVPipeline
   LINK_LIBS
   BiShengIRHIVMDialect
   BiShengIRScopeDialect
+  MLIRIR
+  MLIRPass
+  MLIRTransforms
+  MLIRSupport
+  TritonIR
+  MLIRSCFDialect
 )

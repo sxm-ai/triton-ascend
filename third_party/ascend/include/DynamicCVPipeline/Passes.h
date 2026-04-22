@@ -28,6 +28,8 @@
 namespace mlir {
 namespace triton {
 
+std::unique_ptr<OperationPass<ModuleOp>> createAddIfControlsPass();
+
 #define GEN_PASS_REGISTRATION
 #include "ascend/include/DynamicCVPipeline/Passes.h.inc"
 

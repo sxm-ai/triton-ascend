@@ -18,4 +18,10 @@ def AddDynamicCVPipeline : Pass<"add_dynamic_cv_pipeline", "mlir::ModuleOp"> {
     ];
 }
 
+def AddIfControls : Pass<"add-if-controls", "mlir::ModuleOp"> {
+  let summary = "add if controls for ssbuffer";
+  let constructor = "triton::createAddIfControlsPass()";
+  let dependentDialects = ["hivm::HIVMDialect", "bufferization::BufferizationDialect", "scope::ScopeDialect", "annotation::AnnotationDialect"];
+}
+
 #endif // TRITON_DYNAMIC_CV_PIPELINE_PASSES
