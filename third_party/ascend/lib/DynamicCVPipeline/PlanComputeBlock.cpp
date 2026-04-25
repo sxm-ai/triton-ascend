@@ -22,6 +22,7 @@
 
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/OpClassifier.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlockPass.h"
+#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/PlanCubeBlockPass.h"
 #include "mlir/Pass/PassManager.h"
 #include "llvm/Support/Debug.h"
 
@@ -43,6 +44,7 @@ void PlanComputeBlockPass::runOnOperation()
     pm.addPass(createOpClassifierPass());
 
     // Step 2: Partition compute blocks for core_type=cube
+    pm.addPass(createPlanCubeBlockPass());
 
     // Step 3: Partition compute blocks for core_type=vector
 
