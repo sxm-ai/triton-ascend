@@ -20,15 +20,18 @@
  * THE SOFTWARE.
  */
 
-#include "mlir/Pass/PassManager.h"
 #include "llvm/Support/Debug.h"
-#include "ascend/include/DynamicCVPipeline/Passes.h"
-#include "ascend/include/DynamicCVPipeline/PlanComputeBlockPass.h"
-#include "ascend/include/DynamicCVPipeline/SeparateMemoryFromComputePass.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflowPass.h"
+
+#include "mlir/Pass/PassManager.h"
+
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition.h"
 #include "ascend/include/DynamicCVPipeline/AllocMultiCache.h"
+#include "ascend/include/DynamicCVPipeline/Passes.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/PlanCubeBlockPass.h"
+#include "ascend/include/DynamicCVPipeline/PlanComputeBlockPass.h"
+#include "ascend/include/DynamicCVPipeline/RemoveAttributes.h"
+#include "ascend/include/DynamicCVPipeline/SeparateMemoryFromComputePass.h"
+#include "ascend/include/DynamicCVPipeline/SplitDataflowPass.h"
 
 static constexpr const char *DEBUG_TYPE = "AddDynamicCVPipeline";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
@@ -61,13 +64,13 @@ void AddDynamicCVPipelinePass::runOnOperation()
 
     PassManager pm(&getContext(), moduleOp.getOperationName());
 
-    // todo: add related passes.
     pm.addPass(createPlanComputeBlockPass());
     pm.addPass(createComputeBlockOptPass());
     pm.addPass(createSplitDataflowPass());
     pm.addPass(createSeparateMemoryFromComputePass());
     pm.addPass(createAllocMultiCachePass());
     pm.addPass(createAddControlFlowConditionPass());
+    pm.addPass(createRemoveSsbufAttrPass());
 
     if (failed(runPipeline(pm, getOperation()))) {
         moduleOp->emitError() << "[" << DEBUG_TYPE << "] Pass failed!";
