@@ -24,9 +24,9 @@
 #ifndef TRITON_DYNAMIC_CV_PIPELINE_ADDMULTIBUFFERCONTROL_BUFFER_COUNT_MANAGER_H
 #define TRITON_DYNAMIC_CV_PIPELINE_ADDMULTIBUFFERCONTROL_BUFFER_COUNT_MANAGER_H
 
-#include <vector>
-#include "llvm/ADT/DenseMap.h"
 #include "mlir/IR/Value.h"
+#include "llvm/ADT/DenseMap.h"
+#include <vector>
 
 namespace mlir {
 

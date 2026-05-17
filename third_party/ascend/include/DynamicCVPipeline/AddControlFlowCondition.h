@@ -24,8 +24,10 @@
 #define TRITON_ADAPTER_DYNAMIC_CV_PIPELINE_ADD_CONTROLFLOW_CONDITION_PASS_H
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/SmallVector.h"
 #include "mlir/Dialect/Linalg/TransformOps/DialectExtension.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
@@ -53,10 +55,7 @@ public:
 
   void runOnOperation() override;
 
-  void getDependentDialects(DialectRegistry &registry) const override
-  {
-    registry.insert<LLVM::LLVMDialect>();
-  }
+  void getDependentDialects(DialectRegistry &registry) const override { registry.insert<LLVM::LLVMDialect>(); }
 
   llvm::StringRef getArgument() const override { return "add-control-flow-condition"; }
 };

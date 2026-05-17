@@ -54,6 +54,8 @@ private:
 
 std::unique_ptr<OperationPass<ModuleOp>> createAddBlockIdForControlOpsPass();
 
+void registerAddBlockIdForControlOpsPasses();
+
 } // namespace triton
 } // namespace mlir
 

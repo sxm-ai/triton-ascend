@@ -20,14 +20,14 @@
  * THE SOFTWARE.
  */
 
-#include "llvm/ADT/StringRef.h"
-#include "llvm/Support/LogicalResult.h"
-
+#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ComputeBlockIdManager.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
-
+#include "llvm/ADT/StringRef.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/LogicalResult.h"
+#include "llvm/Support/Debug.h"
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
-#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ComputeBlockIdManager.h"
 
 namespace mlir {
 namespace CVPipeline {

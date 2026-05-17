@@ -51,6 +51,8 @@ public:
 // Create the pass
 std::unique_ptr<OperationPass<ModuleOp>> createPlanComputeBlockPass();
 
+void registerPlanComputeBlockPasses();
+
 } // namespace triton
 } // namespace mlir
 

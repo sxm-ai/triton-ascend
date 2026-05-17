@@ -25,11 +25,11 @@
 #include "mlir/Pass/PassManager.h"
 
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition.h"
+#include "ascend/include/DynamicCVPipeline/RemoveAttributes.h"
 #include "ascend/include/DynamicCVPipeline/AllocMultiCache.h"
 #include "ascend/include/DynamicCVPipeline/Passes.h"
-#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/PlanCubeBlockPass.h"
+#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Passes.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlockPass.h"
-#include "ascend/include/DynamicCVPipeline/RemoveAttributes.h"
 #include "ascend/include/DynamicCVPipeline/SeparateMemoryFromComputePass.h"
 #include "ascend/include/DynamicCVPipeline/SplitDataflowPass.h"
 
@@ -44,7 +44,6 @@ namespace triton {
 } // namespace triton
 } // namespace mlir
 
-using namespace mlir;
 
 AddDynamicCVPipelinePass::AddDynamicCVPipelinePass(
     const AddDynamicCVPipelineOptions &options)

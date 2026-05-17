@@ -20,17 +20,18 @@
  * THE SOFTWARE.
  */
 
-#include "llvm/Support/Debug.h"
-
+#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/OpClassifier.h"
+#include "ascend/include/DynamicCVPipeline/PlanComputeBlockPass.h"
+#include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "mlir/Pass/PassManager.h"
 
-#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ComputeBlockIdManager.h"
-#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/OpClassifier.h"
-#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Passes.h"
-#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ReorderOpsByBlockId.h"
+#include "DynamicCVPipeline/PlanComputeBlock/Passes.h"
+#include "DynamicCVPipeline/PlanComputeBlock/PlanCubeBlockPass.h"
+#include "DynamicCVPipeline/PlanComputeBlock/ReorderOpsByBlockId.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlockPass.h"
-
-#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/PlanCubeBlockPass.h"
+#include "llvm/Support/Debug.h"
+#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Passes.h"
+#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ComputeBlockIdManager.h"
 
 using namespace mlir;
 using namespace triton;
@@ -72,5 +73,14 @@ std::unique_ptr<OperationPass<ModuleOp>> createPlanComputeBlockPass()
 {
     return std::make_unique<PlanComputeBlockPass>();
 }
+
+void registerPlanComputeBlockPasses()
+{
+    registerPass([]() -> std::unique_ptr<mlir::Pass> { return createPlanComputeBlockPass(); });
+    registerPass(createPlanCubeBlockPass);
+    registerPass(createPlanVectorBlockPass);
+    registerPass(createReorderOpsByBlockIdPass);
+}
+
 } // namespace triton
 } // namespace mlir

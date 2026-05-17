@@ -28,6 +28,7 @@
 #include "ascend/include/DynamicCVPipeline/SplitDataflow/PreserveControlAttrsCanonicalize.h"
 #include "ascend/include/DynamicCVPipeline/SplitDataflow/SeparateCVScope.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Transforms/Passes.h"
 #include "llvm/Support/Debug.h"
 
 static constexpr const char *DEBUG_TYPE = "SplitDataflow";

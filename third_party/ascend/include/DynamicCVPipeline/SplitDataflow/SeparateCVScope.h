@@ -52,6 +52,8 @@ public:
 
 std::unique_ptr<OperationPass<ModuleOp>> createSeparateCVScopePass();
 
+void registerSeparateCVScopePasses();
+
 } // namespace triton
 } // namespace mlir
 

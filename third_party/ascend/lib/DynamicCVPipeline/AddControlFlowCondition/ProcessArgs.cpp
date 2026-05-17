@@ -54,12 +54,7 @@ struct SharedArgInfo {
   int nonOwnerBlockId;    // the non-owner block that needs a clone
 };
 
-// Find iter_args shared across multiple block_ids
-static LogicalResult findSharedIterArgs(
-    scf::ForOp forOp,
-    SmallVector<int> &idsInOrder,
-    SmallVector<SharedArgInfo> &sharedArgsInfo,
-    llvm::DenseMap<int, int> &oldArgIndexToNewArgIndexBase)
+static LogicalResult processSharedIterArgsInForOp(scf::ForOp forOp)
 {
   Block *body = forOp.getBody();
   if (!body || !body->mightHaveTerminator()) {
@@ -67,8 +62,8 @@ static LogicalResult findSharedIterArgs(
     return failure();
   }
 
-  // Find which block_ids use which iter_args
-  llvm::DenseMap<int, llvm::DenseSet<int>> argIndexToBlockIds;
+  // Step 1: Find which block_ids use which iter_args
+  llvm::DenseMap<int, llvm::DenseSet<int>> argIndexToBlockIds;  // argIndex -> set of blockIds
   for (Operation &op : body->without_terminator()) {
     auto blockIdAttr = op.getAttrOfType<IntegerAttr>("ssbuffer.block_id");
     if (!blockIdAttr) continue;
@@ -84,13 +79,21 @@ static LogicalResult findSharedIterArgs(
     }
   }
 
-  // Find iter_args used by multiple block_ids
+  // Step 2: Find iter_args used by multiple block_ids (shared args)
+  // Get block_ids in order
+  SmallVector<int> idsInOrder = getBlockIdsInOrder(forOp);
+
+  // For each shared arg, create a SharedArgInfo for each non-owner block
+  SmallVector<SharedArgInfo> sharedArgsInfo;
+  llvm::DenseMap<int, int> oldArgIndexToNewArgIndexBase;  // first new arg index per shared arg
+
   int extraArgCount = 0;
   for (auto &p : argIndexToBlockIds) {
     int argIndex = p.first;
     const llvm::DenseSet<int> &blockIds = p.second;
 
     if (blockIds.size() > 1) {
+      // Find owner block (first in order)
       int ownerBlockId = -1;
       for (int id : idsInOrder) {
         if (blockIds.contains(id)) {
@@ -100,9 +103,11 @@ static LogicalResult findSharedIterArgs(
       }
       if (ownerBlockId == -1) continue;
 
+      // Record the base new arg index for this shared arg
       oldArgIndexToNewArgIndexBase[argIndex] = forOp.getNumRegionIterArgs() + extraArgCount;
       extraArgCount++;
 
+      // For each non-owner block, create a SharedArgInfo
       for (int bid : blockIds) {
         if (bid != ownerBlockId) {
           SharedArgInfo info;
@@ -117,17 +122,16 @@ static LogicalResult findSharedIterArgs(
     }
   }
 
-  return success();
-}
+  if (sharedArgsInfo.empty()) {
+    return success();
+  }
 
-// Find the computation chain for each shared arg
-static LogicalResult findComputationChains(
-    scf::ForOp forOp,
-    SmallVector<SharedArgInfo> &sharedArgsInfo,
-    llvm::DenseMap<int, Operation*> &sharedArgToCompOp,
-    llvm::DenseMap<int, llvm::DenseSet<Operation*>> &sharedArgToChainOps)
-{
-  Block *body = forOp.getBody();
+  LDBG("Found " << sharedArgsInfo.size() << " shared iter_args to process\n");
+
+  // Step 3: Find the computation chain for each shared arg
+  // The chain starts from the owner block's operation that produces the yield input
+  llvm::DenseMap<int, Operation*> sharedArgToCompOp;  // argIndex -> comp op
+  llvm::DenseMap<int, llvm::DenseSet<Operation*>> sharedArgToChainOps;  // argIndex -> chain ops
 
   for (auto &info : sharedArgsInfo) {
     int argIndex = info.argIndex;
@@ -135,12 +139,13 @@ static LogicalResult findComputationChains(
 
     Value iterArg = forOp.getRegionIterArgs()[argIndex];
 
-    // Find the operation in owner block that produces yield input
+    // Find the operation in owner block that uses iterArg and whose result goes to yield
     Operation *compOp = nullptr;
     for (Operation &op : body->without_terminator()) {
       auto blockIdAttr = op.getAttrOfType<IntegerAttr>("ssbuffer.block_id");
       if (!blockIdAttr || blockIdAttr.getInt() != info.ownerBlockId) continue;
 
+      // Check if op uses iterArg
       bool usesIterArg = false;
       for (Value operand : op.getOperands()) {
         if (operand == iterArg) {
@@ -150,6 +155,7 @@ static LogicalResult findComputationChains(
       }
       if (!usesIterArg) continue;
 
+      // Check if result is used by yield
       for (Value result : op.getResults()) {
         for (OpOperand &use : result.getUses()) {
           if (isa<scf::YieldOp>(use.getOwner())) {
@@ -163,7 +169,7 @@ static LogicalResult findComputationChains(
     }
 
     if (!compOp) {
-      LDBG("[Error]: Could not find comp op for arg " << iterArg << "\n");
+      LDBG("Could not find comp op for arg index " << argIndex);
       continue;
     }
 
@@ -191,30 +197,11 @@ static LogicalResult findComputationChains(
     sharedArgToChainOps[argIndex] = chainOps;
   }
 
-  return success();
-}
-
-// Find the last operation in the for body with the given block_id
-static Operation *findLastOpInBlock(Block *body, int blockId)
-{
-  Operation *lastOp = nullptr;
-  for (Operation &op : body->without_terminator()) {
-    auto blockIdAttr = op.getAttrOfType<IntegerAttr>("ssbuffer.block_id");
-    if (blockIdAttr && blockIdAttr.getInt() == blockId) {
-      lastOp = &op;
-    }
-  }
-  return lastOp;
-}
-
-// Create new for op with extra iter_args
-static scf::ForOp createNewForOp(
-    scf::ForOp forOp,
-    llvm::DenseMap<int, int> &oldArgIndexToNewArgIndexBase)
-{
+  // Step 4: Create new for op with extra iter_args
   OpBuilder builder(forOp);
   SmallVector<Value> newInitArgs(forOp.getInitArgs().begin(), forOp.getInitArgs().end());
 
+  // Add new init args (one per shared arg)
   for (auto &p : oldArgIndexToNewArgIndexBase) {
     int oldArgIndex = p.first;
     newInitArgs.push_back(forOp.getInitArgs()[oldArgIndex]);
@@ -224,21 +211,26 @@ static scf::ForOp createNewForOp(
       forOp.getLoc(), forOp.getLowerBound(), forOp.getUpperBound(),
       forOp.getStep(), newInitArgs);
 
+  // Copy attributes
   for (auto &attr : forOp->getAttrs()) {
     newForOp->setAttr(attr.getName(), attr.getValue());
   }
 
-  return newForOp;
-}
+  // Step 5: Migrate body - redirect old block args to new block args, move ops
+  Block *oldBlock = forOp.getBody();
+  Block *newBlock = newForOp.getBody();
 
-// Migrate body from old block to new block
-static void migrateBody(Block *oldBlock, Block *newBlock)
-{
-  // Save old block arguments
+  // Save old block arguments BEFORE replaceAllUsesWith
+  // Note: oldBlock has (1 induction var + N iter_args) arguments
+  // newBlock has (1 induction var + N + M iter_args) arguments where M = num shared args
   SmallVector<Value> oldBlockArgs;
   for (unsigned i = 0; i < oldBlock->getNumArguments(); ++i) {
     oldBlockArgs.push_back(oldBlock->getArgument(i));
   }
+
+  // Map from iter_arg index to block arg index (offset by 1 for induction var)
+  auto getOldBlockArgIdx = [&](int iterArgIdx) { return iterArgIdx + 1; };
+  auto getNewBlockArgIdx = [&](int iterArgIdx) { return iterArgIdx + 1; };
 
   // Redirect block arguments
   for (unsigned i = 0; i < oldBlock->getNumArguments(); ++i) {
@@ -249,81 +241,96 @@ static void migrateBody(Block *oldBlock, Block *newBlock)
   for (Operation &op : llvm::make_early_inc_range(oldBlock->without_terminator())) {
     op.moveBefore(newBlock, newBlock->end());
   }
-}
 
-// Clone computation chain for a non-owner block
-static Value cloneChainForBlock(
-    Block *newBlock,
-    Operation *lastOpInBlock,
-    llvm::DenseSet<Operation*> &chainOps,
-    Operation *compOp,
-    Value oldBlockArg,
-    Value newBlockArg,
-    int nonOwnerBlockId,
-    int argIndex,
-    OpBuilder &builder)
-{
-  SmallVector<Operation *> sortedChain(chainOps.begin(), chainOps.end());
-  if (failed(topologicalSort(sortedChain))) return nullptr;
+  // Step 6: For each shared arg info, clone the chain into the non-owner block
+  // and replace uses of the old iter_arg with the new one
+  SmallVector<Value> clonedResults;  // one per SharedArgInfo, in order
 
-  if (lastOpInBlock) {
-    builder.setInsertionPointAfter(lastOpInBlock);
-  }
+  for (auto &info : sharedArgsInfo) {
+    int argIndex = info.argIndex;
+    Operation *compOp = sharedArgToCompOp[argIndex];
+    if (!compOp) continue;
 
-  IRMapping argMapper;
-  argMapper.map(oldBlockArg, newBlockArg);
+    llvm::DenseSet<Operation*> &chainOps = sharedArgToChainOps[argIndex];
+    if (chainOps.empty()) continue;
 
-  IRMapping resultMapper;
-  for (Operation *op : sortedChain) {
-    IRMapping opMapper;
-    for (OpOperand &operand : op->getOpOperands()) {
-      Value oldVal = operand.get();
-      Value newVal = argMapper.contains(oldVal) ? argMapper.lookup(oldVal) : oldVal;
-      opMapper.map(oldVal, newVal);
+    // Find the last op in the non-owner block
+    Operation *lastOpInBlock = nullptr;
+    for (Operation &op : newBlock->without_terminator()) {
+      auto blockIdAttr = op.getAttrOfType<IntegerAttr>("ssbuffer.block_id");
+      if (blockIdAttr && blockIdAttr.getInt() == info.nonOwnerBlockId) {
+        lastOpInBlock = &op;
+      }
     }
 
-    if (resultMapper.contains(op->getResult(0))) continue;
+    // Create mapper: new iter_arg (at argIndex) -> cloned iter_arg (at newArgIndex)
+    // After replaceAllUsesWith, operations use newBlock->getArgument(argIndex+1)
+    // We need to map this to the clone at newArgIndex+1
+    IRMapping argMapper;
+    Value oldBlockArg = oldBlockArgs[getOldBlockArgIdx(info.argIndex)];  // Save for Step 7 replacement
+    Value newBlockArg = newBlock->getArgument(getNewBlockArgIdx(info.newArgIndex));  // Clone
+    // Map the NEW block arg (which is what operations use after replaceAllUsesWith) to the clone
+    argMapper.map(newBlock->getArgument(getNewBlockArgIdx(info.argIndex)), newBlockArg);
 
-    Operation *cloned = builder.clone(*op, opMapper);
-    cloned->setAttr("ssbuffer.block_id", builder.getI32IntegerAttr(nonOwnerBlockId));
-    cloned->setAttr("ssbuffer.arg", builder.getI32IntegerAttr(argIndex));
+    // Topological sort the chain
+    SmallVector<Operation *> sortedChain(chainOps.begin(), chainOps.end());
+    if (failed(topologicalSort(sortedChain))) continue;
 
-    resultMapper.map(op->getResult(0), cloned->getResult(0));
-    builder.setInsertionPointAfter(cloned);
-  }
+    // Clone the chain after lastOpInBlock
+    OpBuilder cloneBuilder(newBlock, newBlock->end());
+    if (lastOpInBlock) {
+      cloneBuilder.setInsertionPointAfter(lastOpInBlock);
+    }
 
-  return resultMapper.lookup(compOp->getResult(0));
-}
+    IRMapping resultMapper;
+    for (Operation *op : sortedChain) {
+      IRMapping opMapper;
+      // Map operands
+      for (OpOperand &operand : op->getOpOperands()) {
+        Value oldVal = operand.get();
+        Value newVal = oldVal;
+        if (argMapper.contains(oldVal)) {
+          newVal = argMapper.lookup(oldVal);
+        }
+        opMapper.map(oldVal, newVal);
+      }
 
-// Replace uses of old iter_arg with clone in non-owner block
-static void replaceUsesInBlock(
-    Block *block,
-    int nonOwnerBlockId,
-    Value originalArg,
-    Value newBlockArg,
-    OpBuilder &builder,
-    int argIndex)
-{
-  for (Operation &op : block->without_terminator()) {
-    auto blockIdAttr = op.getAttrOfType<IntegerAttr>("ssbuffer.block_id");
-    if (!blockIdAttr || blockIdAttr.getInt() != nonOwnerBlockId) continue;
+      // Skip if already cloned (shouldn't happen with topological sort)
+      if (resultMapper.contains(op->getResult(0))) continue;
 
-    for (unsigned i = 0; i < op.getNumOperands(); ++i) {
-      if (op.getOperand(i) == originalArg) {
-        op.setOperand(i, newBlockArg);
-        op.setAttr("ssbuffer.arg", builder.getI32IntegerAttr(argIndex));
+      // Clone the op
+      Operation *cloned = cloneBuilder.clone(*op, opMapper);
+      cloned->setAttr("ssbuffer.block_id", cloneBuilder.getI32IntegerAttr(info.nonOwnerBlockId));
+      cloned->setAttr("ssbuffer.arg", cloneBuilder.getI32IntegerAttr(info.argIndex));
+
+      resultMapper.map(op->getResult(0), cloned->getResult(0));
+      cloneBuilder.setInsertionPointAfter(cloned);
+    }
+
+    // Record the cloned result
+    Value clonedResult = resultMapper.lookup(compOp->getResult(0));
+    clonedResults.push_back(clonedResult);
+
+    // Step 7: In the non-owner block, replace the iter_arg with the cloned iter_arg
+    // After replaceAllUsesWith, operands already use newBlock->getArgument(argIndex+1)
+    // We need to replace them with newBlock->getArgument(newArgIndex+1) which is the clone
+    Value originalArg = newBlock->getArgument(getNewBlockArgIdx(info.argIndex));
+    for (Operation &op : newBlock->without_terminator()) {
+      auto blockIdAttr = op.getAttrOfType<IntegerAttr>("ssbuffer.block_id");
+      if (!blockIdAttr || blockIdAttr.getInt() != info.nonOwnerBlockId) continue;
+
+      // Check each operand of this op - replace if it matches original arg
+      for (unsigned i = 0; i < op.getNumOperands(); ++i) {
+        Value operandVal = op.getOperand(i);
+        if (operandVal == originalArg) {
+          op.setOperand(i, newBlockArg);
+          op.setAttr("ssbuffer.arg", cloneBuilder.getI32IntegerAttr(info.argIndex));
+        }
       }
     }
   }
-}
 
-// Build new yield with cloned results
-static void buildNewYield(
-    Block *oldBlock,
-    Block *newBlock,
-    SmallVector<Value> &clonedResults,
-    OpBuilder &builder)
-{
+  // Step 8: Build yield with original operands + cloned results
   auto oldYield = cast<scf::YieldOp>(oldBlock->getTerminator());
   SmallVector<Value> yieldOperands;
   for (unsigned i = 0; i < oldYield.getNumOperands(); ++i) {
@@ -334,13 +341,10 @@ static void buildNewYield(
   }
 
   builder.setInsertionPointToEnd(newBlock);
-  builder.create<scf::YieldOp>(newBlock->getParentOp()->getLoc(), yieldOperands);
+  builder.create<scf::YieldOp>(newForOp.getLoc(), yieldOperands);
   oldYield.erase();
-}
 
-// Finalize: replace uses and erase old for op
-static void finalizeForOp(scf::ForOp forOp, scf::ForOp newForOp)
-{
+  // Step 9: Replace uses and erase old for op
   if (forOp.getNumResults() > 0) {
     SmallVector<Value> newResults;
     for (unsigned i = 0; i < forOp.getNumResults(); ++i) {
@@ -349,87 +353,6 @@ static void finalizeForOp(scf::ForOp forOp, scf::ForOp newForOp)
     forOp.replaceAllUsesWith(newResults);
   }
   forOp.erase();
-}
-
-// Process one shared arg: clone chain and replace uses
-static Value processOneSharedArg(
-    Block *newBlock,
-    Block *oldBlock,
-    SharedArgInfo &info,
-    llvm::DenseMap<int, Operation*> &sharedArgToCompOp,
-    llvm::DenseMap<int, llvm::DenseSet<Operation*>> &sharedArgToChainOps)
-{
-  Operation *compOp = sharedArgToCompOp[info.argIndex];
-  if (!compOp) return nullptr;
-
-  llvm::DenseSet<Operation*> &chainOps = sharedArgToChainOps[info.argIndex];
-  if (chainOps.empty()) return nullptr;
-
-  Operation *lastOpInBlock = findLastOpInBlock(newBlock, info.nonOwnerBlockId);
-
-  Value oldBlockArg = oldBlock->getArgument(info.argIndex + 1);
-  Value newBlockArg = newBlock->getArgument(info.newArgIndex + 1);
-
-  OpBuilder cloneBuilder(newBlock, newBlock->end());
-  Value clonedResult = cloneChainForBlock(
-      newBlock, lastOpInBlock, chainOps, compOp,
-      oldBlockArg, newBlockArg,
-      info.nonOwnerBlockId, info.argIndex, cloneBuilder);
-
-  if (clonedResult) {
-    Value originalArg = newBlock->getArgument(info.argIndex + 1);
-    replaceUsesInBlock(newBlock, info.nonOwnerBlockId, originalArg, newBlockArg, cloneBuilder, info.argIndex);
-  }
-
-  return clonedResult;
-}
-
-static LogicalResult processSharedIterArgsInForOp(scf::ForOp forOp)
-{
-  SmallVector<int> idsInOrder = getBlockIdsInOrder(forOp);
-
-  // Step 1: Find shared iter_args
-  SmallVector<SharedArgInfo> sharedArgsInfo;
-  llvm::DenseMap<int, int> oldArgIndexToNewArgIndexBase;
-
-  if (failed(findSharedIterArgs(forOp, idsInOrder, sharedArgsInfo, oldArgIndexToNewArgIndexBase))) {
-    return failure();
-  }
-  if (sharedArgsInfo.empty()) return success();
-
-  LDBG("Found " << sharedArgsInfo.size() << " shared iter_args to process\n");
-
-  // Step 2: Find computation chains
-  llvm::DenseMap<int, Operation*> sharedArgToCompOp;
-  llvm::DenseMap<int, llvm::DenseSet<Operation*>> sharedArgToChainOps;
-
-  if (failed(findComputationChains(forOp, sharedArgsInfo, sharedArgToCompOp, sharedArgToChainOps))) {
-    return failure();
-  }
-
-  // Step 3: Create new for op
-  scf::ForOp newForOp = createNewForOp(forOp, oldArgIndexToNewArgIndexBase);
-  Block *oldBlock = forOp.getBody();
-  Block *newBlock = newForOp.getBody();
-
-  // Step 4: Migrate body
-  migrateBody(oldBlock, newBlock);
-
-  // Step 5: Clone chain and replace uses for each non-owner block
-  OpBuilder builder(forOp);
-  SmallVector<Value> clonedResults;
-
-  for (auto &info : sharedArgsInfo) {
-    Value clonedResult = processOneSharedArg(
-        newBlock, oldBlock, info, sharedArgToCompOp, sharedArgToChainOps);
-    if (clonedResult) clonedResults.push_back(clonedResult);
-  }
-
-  // Step 6: Build new yield
-  buildNewYield(oldBlock, newBlock, clonedResults, builder);
-
-  // Step 7: Replace uses and erase old for op
-  finalizeForOp(forOp, newForOp);
 
   return success();
 }

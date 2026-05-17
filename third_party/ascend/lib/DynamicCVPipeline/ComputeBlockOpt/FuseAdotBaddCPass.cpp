@@ -21,12 +21,19 @@
  */
 
 #include "ascend/include/DynamicCVPipeline/ComputeBlockOpt/Passes.h"
+#include "ascend/include/DynamicCVPipeline/Common/MemoryEffectsTracker.h"
+#include "ascend/include/DynamicCVPipeline/Common/Utils.h"
+#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Common.h"
+#include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Block.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "llvm/Support/Debug.h"
+#include <algorithm>
+#include <cstdint>
 
 #define DEBUG_TYPE "fuse-adotbaddc"
 #define LOG_DEBUG(msg) LLVM_DEBUG(llvm::dbgs() << " [" << DEBUG_TYPE << "] " << msg << "\n")

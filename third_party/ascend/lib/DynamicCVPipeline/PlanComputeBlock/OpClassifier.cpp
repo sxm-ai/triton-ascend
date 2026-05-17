@@ -179,7 +179,7 @@ void OpClassifierPass::matchToTensorPattern(Operation *def)
     cubeSeeds.push_back(toTensorOp);
 
     // Also mark the memref allocation as CUBE
-    Value memref = toTensorOp.getBuffer();
+    Value memref = toTensorOp.getMemref();
     if (Operation *memrefDef = memref.getDefiningOp()) {
         markCube(memrefDef);
         cubeSeeds.push_back(memrefDef);
@@ -1275,9 +1275,9 @@ int OpClassifierPass::preLegalizeMatmul()
         Value zeroValue;
         if (auto floatType = dyn_cast<FloatType>(elemType)) {
             APFloat zeroAPFloat = APFloat::getZero(floatType.getFloatSemantics());
-            zeroValue = builder.create<arith::ConstantFloatOp>(loc, floatType, zeroAPFloat).getResult();
+            zeroValue = builder.create<arith::ConstantFloatOp>(loc, zeroAPFloat, floatType).getResult();
         } else if (auto intType = dyn_cast<IntegerType>(elemType)) {
-            zeroValue = builder.create<arith::ConstantIntOp>(loc, intType, 0).getResult();
+            zeroValue = builder.create<arith::ConstantIntOp>(loc, 0, intType).getResult();
         } else {
             LLVM_DEBUG(DBGS() << "matmul element type is not float or int, skipping\n");
             continue;

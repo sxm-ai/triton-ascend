@@ -56,6 +56,8 @@ private:
 
 std::unique_ptr<OperationPass<ModuleOp>> createMarkMainLoopPass();
 
+void registerMarkMainLoopPasses();
+
 } // namespace triton
 } // namespace mlir
 

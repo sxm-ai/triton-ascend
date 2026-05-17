@@ -21,8 +21,11 @@
  */
 
 #include "ascend/include/DynamicCVPipeline/ComputeBlockOptPass.h"
-#include "ascend/include/DynamicCVPipeline/ComputeBlockOpt/Passes.h"
-#include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ReorderOpsByBlockId.h"
+#include "ascend/include/DynamicCVPipeline/PlanComputeBlockPass.h"
+#include "DynamicCVPipeline/ComputeBlockOpt/Passes.h"
+#include "DynamicCVPipeline/PlanComputeBlock/Passes.h"
+#include "DynamicCVPipeline/PlanComputeBlock/ReorderOpsByBlockId.h"
+#include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 
 #include "mlir/Pass/PassManager.h"
 
