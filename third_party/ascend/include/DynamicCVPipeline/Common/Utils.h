@@ -57,10 +57,13 @@ inline constexpr CoreType fromStrCoreType(std::string_view s)
 
 // Functions for managing core types
 CoreType getOpCoreType(Operation *op);
-
-llvm::LogicalResult verifyOpBlockId(Operation *op);
 std::optional<int64_t> getOpBlockId(Operation *op);
+llvm::LogicalResult verifyOpBlockId(Operation *op);
 
+inline bool isCubeOp(Operation *op)
+{
+    return CVPipeline::getOpCoreType(op) == CoreType::CUBE_ONLY;
+}
 } // namespace CVPipeline
 } // namespace mlir
 

@@ -37,6 +37,10 @@ public:
 
     PlanCubeBlockPass() = default;
     void runOnOperation() override;
+
+    llvm::StringRef getArgument() const final {
+      return "plan-cube-block";
+    }
 };
 
 std::unique_ptr<OperationPass<ModuleOp>> createPlanCubeBlockPass();

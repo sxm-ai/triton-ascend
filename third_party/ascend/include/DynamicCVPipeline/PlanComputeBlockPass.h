@@ -40,6 +40,12 @@ public:
 
     // Run the pass
     void runOnOperation() override;
+
+    // Return the pass argument name
+    static constexpr ::llvm::StringRef getArgumentName() { return "plan-compute-block"; }
+    ::llvm::StringRef getArgument() const override { return "plan-compute-block"; }
+    ::llvm::StringRef getDescription() const override { return "Plan compute blocks for for dynamic CV pipeline"; }
+    ::llvm::StringRef getName() const override { return "PlanComputeBlockPass"; }
 };
 
 // Create the pass

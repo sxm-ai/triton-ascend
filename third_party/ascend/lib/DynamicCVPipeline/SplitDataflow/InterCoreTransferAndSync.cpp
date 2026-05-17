@@ -258,8 +258,8 @@ void InterCoreTransferAndSyncPass::rewriteMatmulWithNewShape(OpBuilder &builder,
     builder.setInsertionPoint(matmulOp);
 
     auto floatElemTy = cast<FloatType>(resType.getElementType());
-    auto zeroConstOp =
-        builder.create<arith::ConstantFloatOp>(loc, floatElemTy, APFloat::getZero(floatElemTy.getFloatSemantics()));
+    auto zeroConstOp = builder.create<arith::ConstantFloatOp>(
+        loc, APFloat::getZero(floatElemTy.getFloatSemantics()), floatElemTy);
     auto tensorEmptyOp = builder.create<tensor::EmptyOp>(loc, expectedShape, resType.getElementType());
     auto linalgFillOp = builder.create<linalg::FillOp>(loc, zeroConstOp.getResult(), tensorEmptyOp.getResult());
 
@@ -321,8 +321,8 @@ mlir::Value InterCoreTransferAndSyncPass::normalizeIfNeeded(OpBuilder &builder, 
     builder.setInsertionPointAfter(origValue.getDefiningOp());
 
     auto floatElemTy = cast<FloatType>(elemType);
-    auto zeroConstOp =
-        builder.create<arith::ConstantFloatOp>(loc, floatElemTy, APFloat::getZero(floatElemTy.getFloatSemantics()));
+    auto zeroConstOp = builder.create<arith::ConstantFloatOp>(
+        loc, APFloat::getZero(floatElemTy.getFloatSemantics()), floatElemTy);
     auto tensorEmptyOp = builder.create<tensor::EmptyOp>(loc, expectedShape, elemType);
     auto linalgFillOp = builder.create<linalg::FillOp>(loc, zeroConstOp.getResult(), tensorEmptyOp.getResult());
     SmallVector<OpFoldResult> offsets = { builder.getIndexAttr(0), builder.getIndexAttr(0) };

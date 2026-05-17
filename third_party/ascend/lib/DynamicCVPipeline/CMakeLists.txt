@@ -47,4 +47,11 @@ add_triton_library(DynamicCVPipeline
   LINK_LIBS
   BiShengIRHIVMDialect
   BiShengIRScopeDialect
+  BiShengIRAnnotationDialect
+  MLIRLinalgTransformOps
+  MLIRLinalgTransforms
+  MLIRSCFTransformOps
+  MLIRTransformDialect
+  MLIRTransformDialectTransforms
+  MLIRTransforms
 )

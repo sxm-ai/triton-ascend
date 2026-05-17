@@ -66,7 +66,7 @@ bool isFusableOp(Operation *op)
             // pass control ops like scf::ForOp/scf::IfOp/scf::WhileOp
             return false;
         }
-        if (op == op->getBlock()->getTerminator()) {
+        if (op->getBlock()->mightHaveTerminator() && op == op->getBlock()->getTerminator()) {
             return false;
         }
         return true;
@@ -207,7 +207,7 @@ static SmallVector<Operation *> findOpsAdjacentToCube(Block *block, const SmallV
 
         for (auto user : allUsers) {
             auto userInBlock = CVPipeline::getAncestorInBlock(user, block);
-            if (!userInBlock || userInBlock == block->getTerminator()) {
+            if (!userInBlock || (block->mightHaveTerminator() && userInBlock == block->getTerminator())) {
                 continue;
             }
             if (!isFusableOp(userInBlock) && !visited[userInBlock]) {

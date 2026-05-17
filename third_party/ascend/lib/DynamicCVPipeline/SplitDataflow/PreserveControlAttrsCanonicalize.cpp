@@ -32,21 +32,17 @@
 
 using namespace mlir;
 
-static constexpr const char *DEBUG_TYPE = "PreserveControlAttrsCanonicalize";
-#define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
-
-template <typename... Args>
-static void logDebug(const Args &...args)
-{
-    LLVM_DEBUG({
-        auto &debugStream = llvm::dbgs();
-        debugStream << '[' << DEBUG_TYPE << "] ";
-        (debugStream << ... << args);
-        debugStream << "\n";
-    });
-}
+#define DEBUG_TYPE "preserve-control-attrs-canonicalize"
+#define LOG_DEBUG(msg) LLVM_DEBUG(llvm::dbgs() << " [" << DEBUG_TYPE << "] " << msg)
 
 namespace {
+
+static void debugDumpIr(StringRef stage, Operation *op)
+{
+    LOG_DEBUG(stage << "\n";
+              op->print(llvm::dbgs());
+              llvm::dbgs() << "\n");
+}
 
 static bool isTrackedControlFlowOp(Operation *op)
 {
@@ -87,41 +83,33 @@ public:
 private:
     Operation *findReplacementOp(Operation *oldOp, ValueRange replacements) const
     {
-        if (!isTrackedControlFlowOp(oldOp)) {
+        if (!isTrackedControlFlowOp(oldOp))
             return nullptr;
-        }
 
         for (Value value : replacements) {
             if (!value)
                 continue;
             Operation *defOp = value.getDefiningOp();
-            if (defOp && recentInserts.contains(defOp) && canTransferAttrs(oldOp, defOp)) {
+            if (defOp && recentInserts.contains(defOp) && canTransferAttrs(oldOp, defOp))
                 return defOp;
-            }
         }
 
         for (Operation *candidate : llvm::reverse(recentInserts.getArrayRef())) {
-            if (canTransferAttrs(oldOp, candidate)) {
+            if (canTransferAttrs(oldOp, candidate))
                 return candidate;
-            }
         }
         return nullptr;
     }
 
     static void transferAttrs(Operation *from, Operation *to)
     {
-        if (!canTransferAttrs(from, to)) {
+        if (!canTransferAttrs(from, to))
             return;
-        }
 
         for (NamedAttribute attr : from->getAttrs()) {
-            if (to->hasAttr(attr.getName())) {
+            if (to->hasAttr(attr.getName()))
                 continue;
-            }
             to->setAttr(attr.getName(), attr.getValue());
-            logDebug("carry attr '", attr.getName(), "' from ",
-                     from->getName().getStringRef(), " to ",
-                     to->getName().getStringRef());
         }
     }
 
@@ -131,11 +119,13 @@ private:
 static void populateCanonicalizationPatterns(MLIRContext *ctx,
                                              RewritePatternSet &patterns)
 {
-    for (Dialect *dialect : ctx->getLoadedDialects()) {
+    for (Dialect *dialect : ctx->getLoadedDialects())
+    {
         dialect->getCanonicalizationPatterns(patterns);
     }
 
-    for (RegisteredOperationName opName : ctx->getRegisteredOperations()) {
+    for (RegisteredOperationName opName : ctx->getRegisteredOperations())
+    {
         opName.getCanonicalizationPatterns(patterns, ctx);
     }
 }
@@ -144,19 +134,22 @@ static void populateCanonicalizationPatterns(MLIRContext *ctx,
 
 void mlir::triton::PreserveControlAttrsCanonicalizePass::runOnOperation()
 {
+    debugDumpIr("before PreserveControlAttrsCanonicalizePass", getOperation());
+
     RewritePatternSet patterns(&getContext());
     populateCanonicalizationPatterns(&getContext(), patterns);
 
-    PreserveControlAttrsListener listener;
     GreedyRewriteConfig config;
-    config.setListener(&listener);
 
-    if (failed(applyPatternsGreedily(getOperation(),
-                                     FrozenRewritePatternSet(std::move(patterns)),
-                                     config))) {
+    if (failed(applyPatternsAndFoldGreedily(getOperation(),
+                                            FrozenRewritePatternSet(std::move(patterns)),
+                                            config))) {
         getOperation()->emitError("PreserveControlAttrsCanonicalizePass failed");
         signalPassFailure();
+        return;
     }
+
+    debugDumpIr("after PreserveControlAttrsCanonicalizePass", getOperation());
 }
 
 namespace mlir {

@@ -38,7 +38,9 @@ public:
     RemoveSsbufAttrPass() = default;
     void runOnOperation() override;
 
-    [[nodiscard]] llvm::StringRef getArgument() const final { return "remove-ssbuf-attr"; }
+    llvm::StringRef getArgument() const final {
+      return "remove-ssbuf-attr";
+    }
 };
 
 std::unique_ptr<OperationPass<ModuleOp>> createRemoveSsbufAttrPass();

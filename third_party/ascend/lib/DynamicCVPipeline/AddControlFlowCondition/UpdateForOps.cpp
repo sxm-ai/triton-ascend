@@ -37,7 +37,7 @@ LLVM_DEBUG({ \
   llvm::outs() << "\n"; \
 })
 
-using namespace llvm;
+using llvm::SmallVector;
 using namespace mlir;
 using namespace triton;
 using namespace hivm;

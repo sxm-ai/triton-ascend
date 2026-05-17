@@ -37,8 +37,8 @@
 #include "mlir/IR/Block.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/Visitors.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/Support/WalkResult.h"
 
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/PlanCubeBlockPass.h"
 
@@ -470,7 +470,12 @@ llvm::SmallVector<Operation *> TopologicalPartitionPlanner::createNewGroupFromQu
         group.push_back(currOp);
         nonAssignedCubeCnt--;
 
-        for (auto *user : llvm::concat<Operation *>(currOp->getUsers(), memGraph.getExecAfter(currOp))) {
+        llvm::SmallVector<Operation *> allUsers;
+        for (auto *user : currOp->getUsers())
+          allUsers.push_back(user);
+        for (auto *user : memGraph.getExecAfter(currOp))
+          allUsers.push_back(user);
+        for (auto *user : allUsers) {
             auto *userInBlock = getAncestorInBlock(user, block);
             if (userInBlock && !newassigned.contains(userInBlock)) {
                 auto &userInDegree = indegree[userInBlock];

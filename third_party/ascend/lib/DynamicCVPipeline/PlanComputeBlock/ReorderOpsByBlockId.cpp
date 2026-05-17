@@ -37,8 +37,8 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Block.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/Visitors.h"
 #include "mlir/Pass/Pass.h"
-#include "mlir/Support/WalkResult.h"
 
 #include "ascend/include/DynamicCVPipeline/Common/MemoryEffectsTracker.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Common.h"
@@ -378,7 +378,6 @@ void ReorderOpsByBlockIdPass::runOnOperation()
     });
 
     LOG_DEBUG("=== Pass TuningOpSeq complete ===\n");
-    ComputeBlockIdManager::getInstance().reset();
 }
 
 std::unique_ptr<OperationPass<ModuleOp>> mlir::triton::createReorderOpsByBlockIdPass()

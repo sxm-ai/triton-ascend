@@ -40,7 +40,6 @@ LLVM_DEBUG({ \
   llvm::outs() << "\n"; \
 })
 
-using namespace llvm;
 using namespace mlir;
 using namespace triton;
 

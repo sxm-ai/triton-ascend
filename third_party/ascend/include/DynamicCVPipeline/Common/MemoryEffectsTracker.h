@@ -23,6 +23,7 @@
 #ifndef TRITON_ADAPTER_DYNAMIC_CV_PIPELINE_COMMON_MEMORY_EFFECTS_TRACKER_H
 #define TRITON_ADAPTER_DYNAMIC_CV_PIPELINE_COMMON_MEMORY_EFFECTS_TRACKER_H
 
+#include "llvm/ADT/SmallPtrSet.h"
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"

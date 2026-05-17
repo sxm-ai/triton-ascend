@@ -103,6 +103,14 @@ public:
   // Run the pass
   void runOnOperation();
 
+  static constexpr ::llvm::StringRef getArgumentName() { return "data-dependency-analysis"; }
+  ::llvm::StringRef getArgument() const override { return "data-dependency-analysis"; }
+  ::llvm::StringRef getDescription() const override
+  {
+      return "Analyze data dependencies between Vector and Cube blocks";
+  }
+  ::llvm::StringRef getName() const override { return "DataDependencyAnalysisPass"; }
+
 private:
 
   void createBlockInfoMap(DataDependencyInfo& info);

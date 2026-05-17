@@ -33,7 +33,9 @@ static constexpr const char *DEBUG_TYPE = "UpdateLoopIterTimes";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
 #define LDBG(...) LLVM_DEBUG(DBGS() << __VA_ARGS__ << "\n")
 
-using namespace llvm;
+using llvm::SmallVector;
+using llvm::DenseMap;
+using llvm::DenseSet;
 using namespace mlir;
 using namespace triton;
 using namespace hivm;
@@ -187,7 +189,7 @@ Value UpdateLoopIterTimesPass::computeNewLoopUpperBound(
     if (ubType.isIndex()) {
       return builder.create<arith::ConstantIndexOp>(loc, val);
     } else if (auto intType = dyn_cast<IntegerType>(ubType)) {
-      return builder.create<arith::ConstantIntOp>(loc, intType, val);
+      return builder.create<arith::ConstantIntOp>(loc, val, intType);
     } else {
       auto indexVal = builder.create<arith::ConstantIndexOp>(loc, val);
       return builder.create<arith::IndexCastOp>(loc, ubType, indexVal);
