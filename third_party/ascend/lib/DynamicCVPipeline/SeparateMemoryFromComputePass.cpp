@@ -23,6 +23,7 @@
 #include "ascend/include/DynamicCVPipeline/SeparateMemoryFromComputePass.h"
 #include "mlir/Pass/PassManager.h"
 #include "llvm/Support/Debug.h"
+#include "ascend/include/DynamicCVPipeline/Common/BufferCountManager.h"
 #include "ascend/include/DynamicCVPipeline/SeparateMemoryFromCompute/AddMultiBufferToGMLoadPass.h"
 #include "ascend/include/DynamicCVPipeline/SeparateMemoryFromCompute/AsyncLoadHoistingPass.h"
 
@@ -33,13 +34,11 @@ static constexpr const char *DEBUG_TYPE = "separate-memory-from-compute";
 using namespace mlir;
 using namespace triton;
 
-static constexpr int kDefaultBufferDepth = 2;
-
 void SeparateMemoryFromComputePass::runOnOperation()
 {
   ModuleOp module = getOperation();
 
-  int depth = kDefaultBufferDepth;
+  int depth = BufferCountManager::getInstance().getBufferCountByType(BufferCountManager::DepType::LoadStore);
 
   if (depth <= 1) {
     LDBG("Buffer depth <= 1, skip multi-buffer transformation");
