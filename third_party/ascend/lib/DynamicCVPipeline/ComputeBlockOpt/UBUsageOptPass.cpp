@@ -19,7 +19,7 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
-
+#include "DynamicCVPipeline/AllocMultiCache/DependencyDataAnalysis.h"
 #include "ascend/include/DynamicCVPipeline/Common/MemoryEffectsTracker.h"
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/ComputeBlockOpt/Passes.h"
@@ -487,14 +487,15 @@ struct DependencyCycleDetector {
     llvm::DenseSet<mlir::Operation *> visited;
     const CVPipeline::MemoryDependenceGraph &memGraph;
     Block *block;
-    int targetBlockId;
     void clear() { visited.clear(); }
     bool operator()(Operation *cur);
     bool dfs(Operation *cur) { return (*this)(cur); };
 
     DependencyCycleDetector(Block *block, const CVPipeline::MemoryDependenceGraph &memGraph,
-                            llvm::DenseSet<mlir::Operation *> &okSet, int targetBlockId = -1)
-        : block(block), memGraph(memGraph), okSet(okSet), targetBlockId(targetBlockId) {}
+                            llvm::DenseSet<mlir::Operation *> &okSet)
+        : block(block), memGraph(memGraph), okSet(okSet)
+    {
+    }
 };
 
 } // namespace
@@ -522,9 +523,6 @@ bool DependencyCycleDetector::operator()(Operation *cur)
             }
         } else {
             for (auto *nx : bm.getOpsByBlockId(bm.getBlockIdByOp(userInBlock))) {
-                if(okSet.contains(nx) && bm.getBlockIdByOp(userInBlock) != targetBlockId) {
-                    return false;
-                }
                 if (dfs(nx)) {
                     return true;
                 }
@@ -545,7 +543,7 @@ static bool willCreateCycle(llvm::SmallVectorImpl<Operation *> &willaddOps, Bloc
     for (auto op : willaddOps) {
         okSet.insert(op);
     }
-    DependencyCycleDetector dfs = {block, memGraph, okSet, targetBlockId};
+    DependencyCycleDetector dfs = {block, memGraph, okSet};
 
     // DFS from every result in okSet
     for (mlir::Operation *okOp : okSet) {
@@ -568,9 +566,6 @@ static bool willCreateCycle(llvm::SmallVectorImpl<Operation *> &willaddOps, Bloc
             }
             auto opsUsedBlockId = bm.getOpsByBlockId(bm.getBlockIdByOp(userInBlock));
             for (auto *userOp : opsUsedBlockId) {
-                if (okSet.contains(userOp)) {
-                    continue;
-                }
                 dfs.clear();
                 if (dfs(userOp)) {
                     return true;
