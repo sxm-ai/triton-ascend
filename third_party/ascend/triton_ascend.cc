@@ -31,6 +31,14 @@
 
 #include <pybind11/pybind11.h>
 
+#include "ascend/include/DynamicCVPipeline/AddControlFlowCondition.h"
+#include "ascend/include/DynamicCVPipeline/AllocMultiCache.h"
+#include "ascend/include/DynamicCVPipeline/ComputeBlockOptPass.h"
+#include "ascend/include/DynamicCVPipeline/PlanComputeBlockPass.h"
+#include "ascend/include/DynamicCVPipeline/RemoveAttributes.h"
+#include "ascend/include/DynamicCVPipeline/SeparateMemoryFromComputePass.h"
+#include "ascend/include/DynamicCVPipeline/SplitDataflowPass.h"
+
 namespace py = pybind11;
 using namespace ir;
 using namespace mlir;
@@ -158,7 +166,7 @@ void init_triton_ascend_ir(py::module &&m) {
             }
             srcShapeIndex.push_back(val);
           }
-          
+
           llvm::SmallVector<Value> srcOffsetIndex;
           for (auto val : srcOffset) {
             if (!val.getType().isIndex()) {
@@ -349,7 +357,7 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
 
   m.def("add_triton_to_llvm", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createTritonToLLVMPass());});
-  
+
   m.def("add_bubble_up_operation", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createBubbleUpOperationPass());});
 
@@ -363,16 +371,38 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
   // todo: this code will be removed in version 530.
   m.def("add_dag_sync", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createDAGSyncPass());});
- 	   
+
   m.def("add_dag_scope", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createDAGScopePass());});
- 	   
+
   m.def("add_dag_ssbuffer", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::createDAGSSBufferPass());});
 
   m.def("set_buffer_count", [](int type, int count) {
     auto depType = static_cast<mlir::triton::BufferCountManager::DepType>(type);
     mlir::triton::BufferCountManager::getInstance().setBufferCount(depType, count);
+  });
+
+  m.def("plan_compute_block", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::createPlanComputeBlockPass());});
+
+  m.def("split_dataflow", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::createSplitDataflowPass());});
+
+  m.def("separate_memory_from_compute", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::createSeparateMemoryFromComputePass());});
+
+  m.def("alloc_multi_cache", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::createAllocMultiCachePass());});
+
+  m.def("add_control_flow_condition", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::createAddControlFlowConditionPass());});
+
+  m.def("compute_block_opt", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::createComputeBlockOptPass());});
+
+  m.def("remove_ssbuf_attr", [](PassManager &pm) {
+    pm.addPass(createRemoveSsbufAttrPass());
   });
 }
 
@@ -391,7 +421,7 @@ void init_triton_ascend(py::module &&m) {
 
   init_triton_ascend_passes_ttir(passes.def_submodule("ttir"));
   init_triton_ascend_ir(m.def_submodule("ascend_ir"));
-  
+
   // Initialize ascend IR bindings (ascendnpu_ir_builder, scope/hivm dialects)
   init_ascend_ir(m.def_submodule("ir"));
 }

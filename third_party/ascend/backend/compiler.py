@@ -166,7 +166,30 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         )
         if metadata["enable_dynamic_cv_pipeline"]:
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
+            # ascend.passes.ttir.plan_compute_block(pm)
+            # ascend.passes.ttir.compute_block_opt(pm)
+            # ascend.passes.ttir.split_dataflow(pm)
+            # ascend.passes.ttir.separate_memory_from_compute(pm)
+            # ascend.passes.ttir.alloc_multi_cache(pm)
+            # ascend.passes.ttir.add_control_flow_condition(pm)
 
+            ascend.passes.ttir.remove_ssbuf_attr(pm)
+
+        _env_val = os.getenv("TRITON_INTRA_CACHE_NUM")
+        _val = int(_env_val) if _env_val is not None else metadata.get("intra_cache_num")
+        if _val is not None:
+            ascend.passes.ttir.set_buffer_count(0, _val)
+
+        _env_val = os.getenv("TRITON_INTER_CACHE_NUM")
+        _val = int(_env_val) if _env_val is not None else metadata.get("inter_cache_num")
+        if _val is not None:
+            ascend.passes.ttir.set_buffer_count(1, _val)
+
+        _env_val = os.getenv("TRITON_LOAD_CACHE_NUM")
+        _val = int(_env_val) if _env_val is not None else metadata.get("load_cache_num")
+        if _val is not None:
+            ascend.passes.ttir.set_buffer_count(2, _val)
+            
         _val = metadata.get("intra_cache_num")
         if _val is not None:
             ascend.passes.ttir.set_buffer_count(0, _val)
