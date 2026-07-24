@@ -57,42 +57,15 @@ using BufferMap = DenseMap<Value, SmallVector<BufferPair>>;
 // Buffer count constants
 constexpr int kBufferCountOne = 1;
 
-// Toggle: when true, producer / consumer buffer chains are inserted at the
-// boundary of the contiguous `ssbuffer.block_id = X` region instead of right
-// after the dep def op / right before the dep user op.
-//
-//   - producer chain: inserted AFTER the last op in depDefinedOp's block that
-//     carries the same `ssbuffer.block_id` as depDefinedOp. If depDefinedOp has
-//     no direct block_id attribute, falls back to "right after depDefinedOp".
-//   - consumer chain: inserted BEFORE the first op in depUser's block that
-//     carries the same `ssbuffer.block_id` as depUser. If depUser has no direct
-//     block_id attribute, falls back to "right before depUser".
-//
-// This keeps the producer/consumer chains grouped with their block_id region
-// rather than interleaved with intermediate compute ops.
-//
-// The toggle is read from a module-level attribute
-// `CVPipeline::kInsertionOptimization` (i.e. "ssbuffer.insertionOptimization").
-// Python callers set it via `set_enable_buffer_insert_optimization` in
-// `triton_ascend.cc`, which writes the attribute onto the ModuleOp. The
-// attribute is checked inline at each `processDepVal` call site below.
 namespace mlir {
 namespace triton {
 
-// Unified view over a main_loop-tagged loop. Supports both scf::ForOp and
-// scf::WhileOp: `body` is the block that carries the loop's per-iteration
-// computation (for-body for forOp, after/do-region for whileOp), and
-// `iterCounter` holds the per-iteration index value used for buffer
-// selection. For forOp the index is derived from iv/lb/step on demand (so
-// `iterCounter` stays null); for whileOp there is no implicit iteration
-// count, so the pass adds a new i32 iter_arg to the whileOp and stores the
-// do-region block-arg here. The counter starts at 0, is yielded back as
-// `counter + 1` at the end of each round, so the value at the top of the
-// do-region is exactly the round index for this iteration.
+// To recognize different loop body
 struct MainLoop {
   Operation *op = nullptr;
   Block *body = nullptr;
-  Value iterCounter; // whileOp: i32 do-region block-arg (round index); forOp: null
+  Value iterCounter; // whileOp: i32 do-region block-arg (round index); forOp:
+                     // null
 
   Block *getBody() const { return body; }
   Operation *getOperation() const { return op; }
@@ -114,9 +87,7 @@ struct MainLoop {
   }
 };
 
-// True for a loop op (forOp / whileOp) that carries the main_loop tag. The
-// attribute normally sits on the op itself, but for forOp it may instead sit
-// on the body terminator (legacy shape), so both are checked.
+// To verify if the loop has main_loop attribute
 static bool hasMainLoopAttr(Operation *op) {
   if (op->hasAttr(kMainLoop))
     return true;
@@ -162,27 +133,9 @@ struct InnerBlockInfo {
   SmallVector<Operation *> ops;
 };
 
-// Effective block_id for cross-block dep judgment: prefer the enclosing
-// multi-region op's block_id (inner ops are attributed to the op itself,
-// not their own innermost id), else the innermost recorded block_id walking
-// up to the main_loop boundary.
 static std::optional<int64_t> getOutermostSsbufferId(Operation *op) {
   std::optional<int64_t> result;
   for (Operation *current = op; current; current = current->getParentOp()) {
-    LLVM_DEBUG(llvm::dbgs() << "[getOutermostSsbufferId] walking current="
-                            << current->getName().getStringRef()
-                            << " hasMainLoop="
-                            << current->hasAttr(kMainLoop)
-                            << " numRegions="
-                            << current->getNumRegions()
-                            << " bid="
-                            << getOpBlockId(current).value_or(-99)
-                            << "\n");
-    // main_loop is the outer boundary for cross-block judgment. A whileOp
-    // main_loop also has >= 2 regions (before + after), so this check MUST
-    // come before the generic multi-region check below; otherwise the loop
-    // op's own block_id would be returned instead of the recorded inner id.
-    // Take the boundary's id only if nothing was recorded on the way up.
     if (current->hasAttr(kMainLoop))
       return result.has_value() ? result : -1;
 
@@ -292,23 +245,7 @@ static void collectDepValue(Value operand, Block *body, Operation *currentOp,
 
   auto currentOutermost = getOutermostSsbufferId(currentOp);
   auto operandOutermost = getOutermostSsbufferId(operand.getDefiningOp());
-  LLVM_DEBUG(llvm::dbgs() << "[collectDepValue] currentOp="
-                          << currentOp->getName().getStringRef()
-                          << " operandDef="
-                          << operand.getDefiningOp()->getName().getStringRef()
-                          << " currentOutermost="
-                          << (currentOutermost.has_value()
-                                  ? std::to_string(*currentOutermost)
-                                  : "null")
-                          << " operandOutermost="
-                          << (operandOutermost.has_value()
-                                  ? std::to_string(*operandOutermost)
-                                  : "null")
-                          << " currentOpBID="
-                          << getOpBlockId(currentOp).value_or(-99)
-                          << " operandDefBID="
-                          << getOpBlockId(operand.getDefiningOp()).value_or(-99)
-                          << "\n");
+
   if (currentOutermost.has_value() && currentOutermost == operandOutermost)
     return;
 
@@ -828,11 +765,6 @@ static void rematerializeTensorRootedScalarDeps(const MainLoop &mainLoop) {
   }
 }
 
-// Compute iteration index used for buffer selection in double buffering.
-//   - forOp: derive from the induction variable as (iv - lb) / step.
-//   - whileOp: there is no implicit iteration count, so return the
-//     pass-created do-region block-arg counter stored on the MainLoop (an
-//     i32 SSA value that already dominates every op inside the do-region).
 static Value getIterCount(OpBuilder &builder, const MainLoop &loop,
                           Location loc, SmallVector<Operation *> *newOps,
                           int blockId = -1) {
@@ -1422,9 +1354,8 @@ static int processNormalConsumerBlock(OpBuilder &consumedBuilder, Value depVal,
 // from index 1 onwards
 static int processMultiRegionAllYields(OpBuilder &consumedBuilder, Value depVal,
                                        SmallVector<BufferPair> &buffers,
-                                       const MainLoop &loop,
-                                       Operation *depUser, int userBlockId,
-                                       int groupId) {
+                                       const MainLoop &loop, Operation *depUser,
+                                       int userBlockId, int groupId) {
   // Generic: check if op has >= 2 regions
   if (depUser->getNumRegions() < 2)
     return 0;
@@ -1444,8 +1375,8 @@ static int processMultiRegionAllYields(OpBuilder &consumedBuilder, Value depVal,
         continue;
 
       Operation *selectIf = insertBufferSelectionInRegion(
-          consumedBuilder, region, yieldOp.getLoc(), depVal, buffers,
-          loop, userBlockId);
+          consumedBuilder, region, yieldOp.getLoc(), depVal, buffers, loop,
+          userBlockId);
       if (!selectIf)
         return -1;
 
@@ -1534,8 +1465,8 @@ static int processDepVal(Value depVal, const MainLoop &loop,
     }
   }
   producedBuffers.setInsertionPointAfter(producerAnchor);
-  SmallVector<Operation *> producerNewOps = insertProducerLogic(
-      producedBuffers, depVal, buffers, loop, groupId);
+  SmallVector<Operation *> producerNewOps =
+      insertProducerLogic(producedBuffers, depVal, buffers, loop, groupId);
   addBlockAttrForOps(producerNewOps, producerId, globalBuilder);
   if (buffers.size() > kBufferCountOne) {
     for (auto *op : producerNewOps) {
@@ -1574,9 +1505,9 @@ static int processDepVal(Value depVal, const MainLoop &loop,
       }
       consumedBuilder.setInsertionPoint(consumerAnchor);
 
-      if (int ret = processMultiRegionAllYields(consumedBuilder, depVal,
-                                                buffers, loop, depUser,
-                                                *userBlockId, groupId))
+      if (int ret =
+              processMultiRegionAllYields(consumedBuilder, depVal, buffers,
+                                          loop, depUser, *userBlockId, groupId))
         return ret;
     } else {
       // Normal op: collect by block_id for batch processing
@@ -1622,9 +1553,9 @@ static int processDepVal(Value depVal, const MainLoop &loop,
       }
       consumedBuilder.setInsertionPoint(consumerAnchor);
 
-      if (int ret = processNormalConsumerBlock(
-              consumedBuilder, depVal, buffers, loop, opsInRegion,
-              userBlockId, groupId, globalBuilder))
+      if (int ret = processNormalConsumerBlock(consumedBuilder, depVal, buffers,
+                                               loop, opsInRegion, userBlockId,
+                                               groupId, globalBuilder))
         return ret;
     }
   }
@@ -1847,8 +1778,8 @@ static int processTensorDependencies(
         continue;
 
       // Process cross-block dependency with double buffering
-      if (processDepVal(depVal, loop, bufferMap, depUserMap,
-                        globalBuilder, *producerId, groupId) != 0)
+      if (processDepVal(depVal, loop, bufferMap, depUserMap, globalBuilder,
+                        *producerId, groupId) != 0)
         return -1;
       groupId++;
     }
@@ -1910,37 +1841,12 @@ hasMemrefDepValue(DenseMap<Value, SmallVector<Value>> &depValueMap) {
 }
 
 // Create a pass-managed global iteration counter for a whileOp main_loop
-// using a do-region iter_arg. whileOp exposes no reliable per-round index
-// (its condition can be arbitrary, and the do-region's existing block args
-// are not guaranteed to count rounds), so we add a new i32 iter_arg to the
-// whileOp:
-//   - init value: arith.constant 0, created right before the whileOp
-//   - in do-region: the counter block arg is available at the top of the
-//     do-region as the last block arg; it carries the round index for this
-//     iteration
-//   - before the existing scf.yield: arith.addi counter, 1, yielded back
-//     as the new iter_arg value for the next round
-//
-// The counter do-region block arg is returned as the first Value so the
-// caller can use it as the iteration index for buffer selection (e.g.
-// arith.remsi counter, N). The new whileOp is returned as the second
-// value so the caller can update any MainLoop pointer that still points
-// at the now-erased old whileOp.
-//
-// The old whileOp is replaced with a structurally-equivalent new whileOp
-// that has one extra init / result / before-arg / after-arg. Region bodies
-// are copied op-by-op with IRMapping so internal SSA references survive.
 static std::pair<Value, scf::WhileOp>
 setupWhileIterArgCounter(const MainLoop &loop, OpBuilder &builder) {
   auto oldWhile = cast<scf::WhileOp>(loop.getOperation());
   Location loc = loop.getLoc();
   MLIRContext *ctx = loop.getContext();
   Type i32Type = builder.getI32Type();
-
-  LLVM_DEBUG(llvm::dbgs()
-             << "[setupWhileIterArgCounter] ENTRY, oldWhile has "
-             << oldWhile.getNumResults() << " results, "
-             << oldWhile.getInits().size() << " inits\n");
 
   // Init constant for the new counter iter_arg (placed right before the
   // existing whileOp; later the new whileOp takes its place there too).
@@ -1959,9 +1865,8 @@ setupWhileIterArgCounter(const MainLoop &loop, OpBuilder &builder) {
   newResultTypes.push_back(i32Type);
 
   LLVM_DEBUG(llvm::dbgs() << "[setupWhileIterArgCounter] newInits.size="
-                          << newInits.size()
-                          << ", newResultTypes.size=" << newResultTypes.size()
-                          << "\n");
+                          << newInits.size() << ", newResultTypes.size="
+                          << newResultTypes.size() << "\n");
 
   // The new counter iter_arg in the do-region block. Captured inside the
   // AfterBuilder once the new do-region block has been constructed.
@@ -1996,25 +1901,16 @@ setupWhileIterArgCounter(const MainLoop &loop, OpBuilder &builder) {
         SmallVector<Value> newCondOps;
         for (Value operand : oldCond->getOperands()) {
           Value mapped = mapper.lookupOrNull(operand);
-          // All non-condition ops were cloned with mapper, so any operand
-          // produced inside the old before region should be remapped. The
-          // fallback to the original operand is a defensive no-op for the
-          // rare case where an operand is somehow external (should not
-          // happen in well-formed scf.while).
           newCondOps.push_back(mapped ? mapped : operand);
         }
         // Pass through the new counter iter_arg into the do-region.
         newCondOps.push_back(iterArgs[numOrig]);
-        // scf.condition's build signature is (condition, ValueRange args);
-        // the first operand is the boolean, the rest are the carried values.
         Value condValue = newCondOps.front();
-        ArrayRef<Value> carriedValues = ArrayRef<Value>(newCondOps).drop_front();
+        ArrayRef<Value> carriedValues =
+            ArrayRef<Value>(newCondOps).drop_front();
         bb.create<scf::ConditionOp>(bl, condValue, carriedValues);
       },
       [&](OpBuilder &ab, Location al, ValueRange iterArgs) {
-        // ---- After / do region ----
-        // Capture the counter iter_arg BEFORE cloning so the increment
-        // expression below can reference it directly.
         Block *oldAfter = oldWhile.getAfterBody();
         unsigned numOrig = oldAfter->getNumArguments();
         counterIterArg = iterArgs[numOrig];
@@ -2035,13 +1931,6 @@ setupWhileIterArgCounter(const MainLoop &loop, OpBuilder &builder) {
         if (!oldYield)
           return;
 
-        // Increment the counter and append to the yielded operands list.
-        // Determine the block_id by inspecting the surrounding ops in the
-        // do-region (use the last op with a block_id attribute, since the
-        // counter participates in the do-region's main work and should be
-        // tagged consistently with those ops). Falling back to the
-        // main_loop's block_id keeps the legacy behavior when no other op
-        // in the do-region is tagged.
         std::optional<int> counterBlockId;
         if (Block *doBlock = ab.getInsertionBlock()) {
           for (Operation &op : llvm::reverse(*doBlock)) {
@@ -2055,14 +1944,8 @@ setupWhileIterArgCounter(const MainLoop &loop, OpBuilder &builder) {
           counterBlockId = getOpBlockId(oldWhile);
 
         Value one = ab.create<arith::ConstantIntOp>(al, 1, 32);
-        Value nextCounter =
-            ab.create<arith::AddIOp>(al, counterIterArg, one);
+        Value nextCounter = ab.create<arith::AddIOp>(al, counterIterArg, one);
 
-        // Tag the counter arithmetic with the resolved block_id so it is
-        // consistent with the surrounding do-region ops. Without this the
-        // polling ops are untyped and break downstream consumers that walk
-        // ops by block_id (e.g. dispatch / buffer_index calc walks via
-        // getOpBlockId).
         if (counterBlockId) {
           one.getDefiningOp()->setAttr(kBlockId,
                                        ab.getI32IntegerAttr(*counterBlockId));
@@ -2079,25 +1962,15 @@ setupWhileIterArgCounter(const MainLoop &loop, OpBuilder &builder) {
         ab.create<scf::YieldOp>(al, newYieldOps);
       });
 
-  // Copy attributes from the old whileOp onto the new one. The
-  // `create<scf::WhileOp>` builder does NOT carry over attributes; without
-  // this copy the new whileOp loses `ssbuffer.main_loop`, `ssbuffer.block_id`
-  // and friends, breaking downstream attribute checks (e.g.
-  // `getOutermostSsbufferId` walks up parents looking for `kMainLoop` to
-  // bound the cross-block judgment).
   for (auto attr : oldWhile->getAttrs())
     newWhile->setAttr(attr.getName(), attr.getValue());
 
-  // Replace uses of the old whileOp's results with the new whileOp's
-  // corresponding results. The new whileOp's last result is the round
-  // counter (consumers can ignore it).
   for (unsigned i = 0, e = oldWhile.getNumResults(); i < e; ++i)
     oldWhile.getResult(i).replaceAllUsesWith(newWhile.getResult(i));
   oldWhile.erase();
 
-  LLVM_DEBUG(llvm::dbgs()
-             << "[setupWhileIterArgCounter] EXIT, counterIterArg="
-             << (counterIterArg ? "set" : "null") << "\n");
+  LLVM_DEBUG(llvm::dbgs() << "[setupWhileIterArgCounter] EXIT, counterIterArg="
+                          << (counterIterArg ? "set" : "null") << "\n");
 
   return {counterIterArg, newWhile};
 }
@@ -2129,18 +2002,14 @@ static int addInnerMultiBuffer(MainLoop mainLoop, OpBuilder &builder,
   DenseMap<Value, SmallVector<Value>> depValueMap;
   SmallVector<Operation *> allOps;
 
-  // whileOp has no implicit iteration count. When multi-buffering is actually
-  // requested (bufNum > 1), create a pass-managed global counter BEFORE
-  // dep collection so the dep walk sees the new do-region (the OLD whileOp
-  // gets erased inside the counter setup, so any Values collected from the
-  // old do-region would dangle). Single-buffer scopes skip the counter
-  // entirely to avoid a dead iter_arg.
+  // whileOp: bufNum>1 needs pre-created counter (no implicit iter count);
+  // bufNum==1 skips to avoid dead iter_arg.
   if (mainLoop.isWhile()) {
     BufferCountManager bufferCountMgr(mainLoop.getOperation());
     int bufNum = bufferCountMgr.getBufferCountByType(
         BufferCountManager::DepType::IntraCore);
-    LLVM_DEBUG(llvm::dbgs() << "[addInnerMultiBuffer] whileOp bufNum="
-                            << bufNum << "\n");
+    LLVM_DEBUG(llvm::dbgs()
+               << "[addInnerMultiBuffer] whileOp bufNum=" << bufNum << "\n");
     if (bufNum > kBufferCountOne) {
       auto [counter, newWhile] =
           setupWhileIterArgCounter(mainLoop, globalBuilder);
@@ -2151,17 +2020,17 @@ static int addInnerMultiBuffer(MainLoop mainLoop, OpBuilder &builder,
       mainLoop.iterCounter = counter;
       LLVM_DEBUG(llvm::dbgs()
                  << "[addInnerMultiBuffer] iterCounter set, type="
-                 << (mainLoop.iterCounter
-                         ? mainLoop.iterCounter.getType()
-                         : Type(nullptr))
+                 << (mainLoop.iterCounter ? mainLoop.iterCounter.getType()
+                                          : Type(nullptr))
                  << "\n");
-      LLVM_DEBUG(llvm::dbgs() << "[addInnerMultiBuffer] DUMP after counter setup:\n"
-                              << *newWhile << "\n");
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[addInnerMultiBuffer] DUMP after counter setup:\n"
+                 << *newWhile << "\n");
     }
   }
 
-  if (collectInnerBlockInfo(mainLoop, blocks, depValueMap, allOps,
-                            i1Found) != 0)
+  if (collectInnerBlockInfo(mainLoop, blocks, depValueMap, allOps, i1Found) !=
+      0)
     return -1;
 
   if (blocks.empty())
@@ -2172,15 +2041,10 @@ static int addInnerMultiBuffer(MainLoop mainLoop, OpBuilder &builder,
   // consumer-block users; the cloned fills will rewrite those users' uses.
   DenseMap<Value, SmallVector<Operation *>> initialDepUserMap =
       buildDepUserMap(blocks, allOps, depValueMap);
-  if (cloneEmptyFillsInBlocks(mainLoop, blocks, depValueMap,
-                              initialDepUserMap, globalBuilder) != 0)
+  if (cloneEmptyFillsInBlocks(mainLoop, blocks, depValueMap, initialDepUserMap,
+                              globalBuilder) != 0)
     return -1;
 
-  // Break tensor-rooted cross-block scalar dependencies AFTER the empty+fill
-  // clone. The clone can introduce fresh scalar refs (e.g. a cloned
-  // arith.extf whose operand is a producer-side tensor.extract) that need to
-  // be rematerialized to a block-local chain reading from a Phase-2
-  // multi-buffer. Running this before the clone leaves these refs invisible.
   rematerializeTensorRootedScalarDeps(mainLoop);
 
   // Phase 2: re-collect deps now that cloned ops (and rematerialized scalar
@@ -2190,8 +2054,8 @@ static int addInnerMultiBuffer(MainLoop mainLoop, OpBuilder &builder,
   blocks.clear();
   depValueMap.clear();
   allOps.clear();
-  if (collectInnerBlockInfo(mainLoop, blocks, depValueMap, allOps,
-                            i1Found) != 0)
+  if (collectInnerBlockInfo(mainLoop, blocks, depValueMap, allOps, i1Found) !=
+      0)
     return -1;
 
   // Phase 2 may surface i1 tensor deps that the clone introduced (e.g. a
@@ -2211,48 +2075,50 @@ static int addInnerMultiBuffer(MainLoop mainLoop, OpBuilder &builder,
     for (auto &p : depValueMap) {
       Value groupKey = p.first;
       Operation *groupDefOp = groupKey.getDefiningOp();
-      LLVM_DEBUG(llvm::dbgs() << "  group: " << groupKey
-                              << " (defOp: "
-                              << (groupDefOp
-                                      ? groupDefOp->getName().getStringRef()
-                                      : llvm::StringRef("BlockArg"))
-                              << ", block_id="
-                              << (groupDefOp ? getOpBlockId(groupDefOp).value_or(-99)
-                                            : -99)
-                              << ")\n");
+      LLVM_DEBUG(llvm::dbgs()
+                 << "  group: " << groupKey << " (defOp: "
+                 << (groupDefOp ? groupDefOp->getName().getStringRef()
+                                : llvm::StringRef("BlockArg"))
+                 << ", block_id="
+                 << (groupDefOp ? getOpBlockId(groupDefOp).value_or(-99) : -99)
+                 << ")\n");
       for (Value depVal : p.second) {
         Operation *defOp = depVal.getDefiningOp();
-        LLVM_DEBUG(llvm::dbgs() << "    - " << depVal
-                                << " (defOp: "
-                                << (defOp ? defOp->getName().getStringRef()
-                                          : llvm::StringRef("BlockArg"))
-                                << ", block_id="
-                                << (defOp ? getOpBlockId(defOp).value_or(-99)
-                                          : -99)
-                                << ")\n");
+        LLVM_DEBUG(llvm::dbgs()
+                   << "    - " << depVal << " (defOp: "
+                   << (defOp ? defOp->getName().getStringRef()
+                             : llvm::StringRef("BlockArg"))
+                   << ", block_id="
+                   << (defOp ? getOpBlockId(defOp).value_or(-99) : -99)
+                   << ")\n");
       }
     }
-    LDBG("ERROR: Memref type dependent values found!");
+    LDBG("Falling Back: Memref type dependent values found!");
     return -1;
   }
 
   auto depUserMap = buildDepUserMap(blocks, allOps, depValueMap);
 
-  LLVM_DEBUG(llvm::dbgs() << "[addInnerMultiBuffer] before collectBufferValues\n");
+  LLVM_DEBUG(
+      llvm::dbgs() << "[addInnerMultiBuffer] before collectBufferValues\n");
   auto valueList = collectBufferValues(depValueMap);
-  LLVM_DEBUG(llvm::dbgs() << "[addInnerMultiBuffer] before insertBuffersBeforeLoop, valueList.size="
-                          << valueList.size() << "\n");
+  LLVM_DEBUG(
+      llvm::dbgs()
+      << "[addInnerMultiBuffer] before insertBuffersBeforeLoop, valueList.size="
+      << valueList.size() << "\n");
 
   auto bufferMap =
       insertBuffersBeforeLoop(mainLoop, valueList, builder, groupId);
 
-  LLVM_DEBUG(llvm::dbgs() << "[addInnerMultiBuffer] before collectScalarDeps\n");
+  LLVM_DEBUG(
+      llvm::dbgs() << "[addInnerMultiBuffer] before collectScalarDeps\n");
   auto scalarValueList = collectScalarDeps(depValueMap, depUserMap);
 
   LLVM_DEBUG(llvm::dbgs() << "[addInnerMultiBuffer] before markScalarDeps\n");
   markScalarDeps(scalarValueList, depUserMap, globalBuilder, 1);
 
-  LLVM_DEBUG(llvm::dbgs() << "[addInnerMultiBuffer] before processTensorDependencies\n");
+  LLVM_DEBUG(llvm::dbgs()
+             << "[addInnerMultiBuffer] before processTensorDependencies\n");
   if (processTensorDependencies(mainLoop, blocks, depValueMap, depUserMap,
                                 bufferMap, globalBuilder, groupId) != 0) {
     return -1;
@@ -2318,22 +2184,16 @@ void AddMultiBufferInnerScopePass::runOnOperation() {
       // i1Found is reset per main_loop so it only triggers fallback for
       // the current scope's deps.
       bool i1Found = false;
-      int ret =
-          addInnerMultiBuffer(mainLoop, builder, scope, groupId, i1Found);
+      int ret = addInnerMultiBuffer(mainLoop, builder, scope, groupId, i1Found);
       if (i1Found) {
-        // i1 tensor deps are not safe to multi-buffer; mark the module
-        // with ERRCODE_IGNORED and bail out so downstream passes see the
-        // fallback attribute. Mirrors the AnalyzeName pass pattern:
-        // setFallbackAttr(module) + signalPassFailure() + return.
         LDBG("i1 tensor dep found, setting fallback attribute");
-        CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
-        signalPassFailure();
+        CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_IGNORED);
         return WalkResult::interrupt();
       }
       if (ret != 0) {
         LDBG(
             "addInnerMultiBuffer failed for main_loop; signaling pass failure");
-        signalPassFailure();
+        CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
         return WalkResult::interrupt();
       }
     }
