@@ -124,6 +124,8 @@ bool isScalarLike(Value value);
 bool isStoreLike(Operation *op);
 bool isViewLike(Operation *op);
 
+int getLoopCarriedArgIndex(Value operand, Block *block);
+
 } // namespace CVPipeline
 } // namespace mlir
 
