@@ -22,6 +22,7 @@
 
 #include "llvm/Support/Debug.h"
 
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/PassManager.h"
 
@@ -37,6 +38,7 @@
 #include "ascend/include/DynamicCVPipeline/SeparateMemoryFromComputePass.h"
 #include "ascend/include/DynamicCVPipeline/SplitDataflowPass.h"
 #include "ascend/include/DynamicCVPipeline/StandardizeOp.h"
+#include "ascend/include/DynamicCVPipeline/UpliftWhileToFor.h"
 
 static constexpr const char *DEBUG_TYPE = "AddDynamicCVPipeline";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
@@ -85,6 +87,8 @@ void AddDynamicCVPipelinePass::runOnOperation() {
   ModuleOp moduleBackup(moduleOp->clone());
   PassManager pm(&getContext(), moduleOp.getOperationName());
 
+  // Lift canonical for-shaped scf.while to scf.for.
+  pm.nest<func::FuncOp>().addPass(createUpliftWhileToForPass());
   pm.addPass(createPreCheckAvailablePass());
   pm.addPass(createStandardizeOpPass());
   pm.addPass(createPlanComputeBlockPass());
