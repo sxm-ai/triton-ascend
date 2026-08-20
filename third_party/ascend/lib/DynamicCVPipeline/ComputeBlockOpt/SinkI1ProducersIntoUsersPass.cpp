@@ -27,9 +27,11 @@
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ComputeBlockIdManager.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
+#include "mlir/Support/LLVM.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
 
@@ -64,7 +66,13 @@ public:
 
 namespace {
 
-static bool isI1Producer(Operation *op) {
+static bool isValidI1Producer(Operation *op) {
+  if (isa<scf::SCFDialect>(op->getDialect())) {
+    return false;
+  }
+  if (op->getNumResults() > 1) {
+    return false;
+  }
   for (auto result : op->getResults()) {
     if (auto tensorType = dyn_cast<mlir::TensorType>(result.getType())) {
       mlir::Type elemType = tensorType.getElementType();
@@ -101,33 +109,44 @@ void SinkI1ProducersIntoUsersPass::runOnOperation() {
   SmallVector<Operation *> producers;
   // find single-result and regionless op with i1 tensor result-type
   moduleOp.walk([&](Operation *op) {
-    if (isI1Producer(op) && isPureAndRegionless(op)) {
+    if (isValidI1Producer(op) && isPureAndRegionless(op)) {
       LOG_DEBUG("found i1 producer: " << *op << "\n");
       producers.push_back(op);
     }
   });
 
-  for (Operation *p : producers) {
-    DenseSet<int> seenBlockIds;
+  for (Operation *p : llvm::reverse(producers)) {
+    SetVector<Operation*> consumers;
     for (OpOperand &use : p->getUses()) {
       Operation *consumer = use.getOwner();
-      if (bm.isSameBlock(p, consumer)) {
+      auto consumerInblock = CVPipeline::getAncestorInBlock(consumer, p->getBlock());
+      if(!consumerInblock) {
+        continue;
+      }
+      consumers.insert(consumerInblock);
+    }
+    DenseSet<int> seenBlockIds;
+    auto orderedConsumuers = mlir::topologicalSort(consumers);
+    for (auto consumerInblock: orderedConsumuers) {
+      
+      if (bm.isSameBlock(p, consumerInblock)) {
+        LOG_DEBUG("producer and consumer has same blockId.\n");
         continue;
       }
 
       // clone producer op to consumer block and adapt use
-      int consumerBlockId = bm.getBlockIdByOp(consumer);
+      int consumerBlockId = bm.getBlockIdByOp(consumerInblock);
+      if (consumerBlockId == -1) {
+        continue;
+      }
       if (!seenBlockIds.insert(consumerBlockId).second) {
         continue;
       }
-      Operation *cloned = OpBuilder(consumer).clone(*p);
-      use.set(cloned->getResult(0));
-      bm.updateBlockId(cloned, consumerBlockId);
+      p->moveBefore(consumerInblock);
+      LOG_DEBUG("update blockid for " << *p << " to " << consumerBlockId
+                                      << "\n");
+      bm.updateBlockId(p, consumerBlockId);
     }
-
-    // erase producer with no user left
-    if (p->use_empty())
-      p->erase();
   }
 }
 
