@@ -267,6 +267,16 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             # Keep the existing default-on buffer insertion behavior.
             ascend.passes.ttir.set_enable_buffer_insert_optimization(mod)
             ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)
+            # ascend.passes.ttir.pre_check_available(pm)
+            # ascend.passes.ttir.standardize_op(pm)
+            # ascend.passes.ttir.plan_compute_block(pm)
+            # ascend.passes.ttir.compute_block_opt(pm)
+            # ascend.passes.ttir.split_dataflow(pm)
+            # ascend.passes.ttir.analyse_dataflow(pm)
+            # ascend.passes.ttir.separate_memory_from_compute(pm)
+            # ascend.passes.ttir.alloc_multi_cache(pm)
+            # ascend.passes.ttir.add_control_flow_condition(pm)
+            # ascend.passes.ttir.remove_ssbuf_attr(pm)
 
         if _enable_msdebug():
             ascend.passes.ttir.add_normalize_debug_line_locations(pm)
