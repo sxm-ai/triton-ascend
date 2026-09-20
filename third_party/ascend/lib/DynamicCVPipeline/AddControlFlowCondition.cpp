@@ -136,7 +136,7 @@ void AddControlFlowConditionPass::runOnOperation() {
   pm.addPass(std::move(updateLoopIterTimesPass));
 
   // Step7: Wrap ssbuffer.if with unique first-level ssbuffer.splitted_if
-  // cond (for only). Inner split if is kept; else ++ the block counter.
+  // cond (for only). Inner split if then is spliced in; else ++ counter.
   pm.addPass(createWrapSplittedIfPass(&info));
 
   if (failed(runPipeline(pm, module))) {

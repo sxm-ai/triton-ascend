@@ -27,6 +27,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/Visitors.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -287,6 +288,39 @@ moveDefChainBefore(Value cond, Operation *fromAnchor, Operation *before,
   return success();
 }
 
+// Outer wrapper already gates on the split cond, so the inner then always
+// runs. Splice then-body into the parent; replace %if#N with then-yield
+// values; drop else. Never move the then terminator — a yield in the
+// parent would cut off copies / counter updates and hang.
+static LogicalResult unwrapSplittedIf(scf::IfOp splitIf) {
+  Block *thenBlock = splitIf.thenBlock();
+  if (!thenBlock || !thenBlock->mightHaveTerminator())
+    return failure();
+  auto thenYield = dyn_cast<scf::YieldOp>(thenBlock->getTerminator());
+  if (!thenYield)
+    return failure();
+  SmallVector<Value> thenVals(thenYield.getOperands().begin(),
+                              thenYield.getOperands().end());
+  if (splitIf.getNumResults() != thenVals.size())
+    return failure();
+  for (Value val : thenVals) {
+    if (val.getDefiningOp() == splitIf.getOperation())
+      return failure();
+  }
+
+  SmallVector<Operation *> thenOps;
+  for (Operation &op : *thenBlock) {
+    if (!op.hasTrait<OpTrait::IsTerminator>())
+      thenOps.push_back(&op);
+  }
+  for (Operation *op : thenOps)
+    op->moveBefore(splitIf);
+
+  splitIf.replaceAllUsesWith(thenVals);
+  splitIf.erase();
+  return success();
+}
+
 static void replaceTerminator(Block *block, Location loc, ValueRange operands) {
   if (block->mightHaveTerminator())
     block->getTerminator()->erase();
@@ -367,6 +401,10 @@ static LogicalResult wrapSsbufIf(scf::IfOp ssbufIf, scf::ForOp forOp,
   } else if (failed(moveDefChainBefore(ssbufCond, wrapper.getOperation(),
                                        ssbufIf.getOperation(), splitCondOps))) {
     LDBG("Keep ssbuffer.if cond ops outside wrapper then.\n");
+  }
+
+  if (failed(unwrapSplittedIf(splitIf))) {
+    LDBG("Keep inner splitted_if; cannot splice then-body.\n");
   }
 
   replaceTerminator(thenBlock, loc, ssbufIf.getResults());
