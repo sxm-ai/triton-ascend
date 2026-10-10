@@ -79,6 +79,47 @@ static scf::IfOp getUniqueFirstLevelSplittedIf(scf::IfOp ssbufIf) {
   return found;
 }
 
+static bool regionHasRealTensorCompute(Region &region) {
+  if (region.empty())
+    return false;
+  return region
+      .walk([&](Operation *op) {
+        return isRealTensorComputeOp(op) ? WalkResult::interrupt()
+                                         : WalkResult::advance();
+      })
+      .wasInterrupted();
+}
+
+// `splitIf` is the only ssbuffer.splitted_if anywhere under `ssbufIf`.
+// getUniqueFirstLevelSplittedIf only looks at the then block's first level.
+static bool isOnlySplittedIf(scf::IfOp ssbufIf, scf::IfOp splitIf) {
+  bool extra = false;
+  ssbufIf.walk([&](scf::IfOp ifOp) {
+    if (ifOp == ssbufIf || !ifOp->hasAttr(kSplittedIf))
+      return WalkResult::advance();
+    if (ifOp == splitIf)
+      return WalkResult::advance();
+    extra = true;
+    return WalkResult::interrupt();
+  });
+  return !extra;
+}
+
+// Real tensor compute is allowed only in splitIf's then. The else is dropped
+// by the wrap, and every other op in ssbufIf moves under the split cond.
+static bool computeOnlyInSplitThen(scf::IfOp ssbufIf, scf::IfOp splitIf) {
+  if (regionHasRealTensorCompute(splitIf.getElseRegion()))
+    return false;
+  WalkResult walk = ssbufIf->walk([&](Operation *op) {
+    if (op == splitIf.getOperation())
+      return WalkResult::skip();
+    if (isRealTensorComputeOp(op))
+      return WalkResult::interrupt();
+    return WalkResult::advance();
+  });
+  return !walk.wasInterrupted();
+}
+
 static int collectConditionDefOpsInside(Value value, scf::IfOp ssbufIf,
                                         DenseSet<Operation *> &ops) {
   if (!value)
@@ -333,6 +374,14 @@ static LogicalResult wrapSsbufIf(scf::IfOp ssbufIf, scf::ForOp forOp,
   scf::IfOp splitIf = getUniqueFirstLevelSplittedIf(ssbufIf);
   if (!splitIf)
     return success();
+  if (!isOnlySplittedIf(ssbufIf, splitIf)) {
+    LDBG("Skip wrap: ssbuffer.if contains more than one splitted_if.\n");
+    return success();
+  }
+  if (!computeOnlyInSplitThen(ssbufIf, splitIf)) {
+    LDBG("Skip wrap: real tensor compute outside the splitted_if then.\n");
+    return success();
+  }
   if (!info->cntArgs.count(ssbufIf)) {
     LDBG("Skip wrap: ssbuffer.if has no cntArgs.\n");
     return success();
