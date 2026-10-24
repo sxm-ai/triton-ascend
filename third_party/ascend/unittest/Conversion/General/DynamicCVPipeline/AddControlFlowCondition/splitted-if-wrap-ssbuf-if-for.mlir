@@ -1,38 +1,48 @@
-// RUN: triton-opt --add-control-flow-condition %s --allow-unregistered-dialect | FileCheck %s --implicit-check-not=triton_ascend.dynamic_cv_pipeline.rc
+// RUN: triton-opt --add-control-flow-condition %s | FileCheck %s --implicit-check-not=triton_ascend.dynamic_cv_pipeline.rc
 
-// for's else reads cntArgs. AddControlFlowConditionPass fills that map and
-// then runs SplittedIfWrapSsbufIf, so this input is the pre-pipeline shape:
-// one main scf.for, one block_id, and a splitted_if. The intraDeps pair keeps
-// UpdateConditionInfo from bailing out before the wrap.
+// VECTOR and CUBE each have one main scf.for and one intraDeps pair, so the
+// pipeline reaches SplittedIfWrapSsbufIf. The two pairs use different intra
+// groups: one group lists every producer, and calculateFactor looks those
+// producers up inside the current for. Block 5's mulf is inside one
+// splitted_if. The new if's else adds the block counter and the for step.
 
 // CHECK-LABEL: func.func @wrap_for_splitted_if
-// Tensor compute from the splitted_if then stays in the ssbuffer.if then.
 // CHECK: arith.mulf {{.*}} : tensor<4xf32>
-// CHECK: } {{.*}}ssbuffer.if = 1 : i32}
-// The new if's else adds the block counter and the for step.
+// CHECK: } {{.*}}ssbuffer.if = 5 : i32}
 // CHECK: arith.addi
 // CHECK: } {{.*}}ssbuffer.splitted_if = 0 : i32}
 
-module {
-  func.func @wrap_for_splitted_if() -> (i32, i32) {
+module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, ssbuffer.intra_buf_count = 2 : i32} {
+  func.func @wrap_for_splitted_if() attributes {global_kernel = "local", mix_mode = "mix", parallel_mode = "simd"} {
     %c0_i32 = arith.constant 0 : i32
     %c1_i32 = arith.constant 1 : i32
-    %c4_i32 = arith.constant 4 : i32
+    %c16_i32 = arith.constant 16 : i32
     %zero = arith.constant dense<0.000000e+00> : tensor<4xf32>
     %one = arith.constant dense<1.000000e+00> : tensor<4xf32>
-    %0:2 = scf.for %arg0 = %c0_i32 to %c4_i32 step %c1_i32
-        iter_args(%arg1 = %c0_i32, %arg2 = %c0_i32) -> (i32, i32) : i32 {
-      %produced = arith.addi %arg2, %c0_i32 {ssbuffer.block_id = 1 : i32, ssbuffer.intraDeps = [0 : i32, 1 : i32]} : i32
-      %split = arith.cmpi sgt, %arg0, %c0_i32 {ssbuffer.block_id = 1 : i32} : i32
-      %inner = scf.if %split -> (i32) {
-        %t = arith.mulf %zero, %one : tensor<4xf32>
-        %consumed = arith.addi %produced, %c0_i32 {ssbuffer.intraDeps = [0 : i32, 0 : i32]} : i32
-        scf.yield %consumed : i32
-      } else {
-        scf.yield %arg1 : i32
-      } {ssbuffer.block_id = 1 : i32, ssbuffer.splitted_if = 0 : i32}
-      scf.yield %inner, %produced : i32, i32
-    } {ssbuffer.main_loop = 0 : i32}
-    return %0#0, %0#1 : i32, i32
+
+    scope.scope : () -> () {
+      %0 = scf.for %arg0 = %c0_i32 to %c16_i32 step %c1_i32
+          iter_args(%arg1 = %c0_i32) -> (i32) : i32 {
+        %split = arith.cmpi sgt, %arg0, %c0_i32 {ssbuffer.block_id = 5 : i32} : i32
+        scf.if %split {
+          %t = arith.mulf %zero, %one : tensor<4xf32>
+        } {ssbuffer.block_id = 5 : i32, ssbuffer.splitted_if = 0 : i32}
+        %prod = arith.addi %arg1, %c0_i32 {ssbuffer.block_id = 5 : i32, ssbuffer.intraDeps = [0 : i32, 1 : i32]} : i32
+        %cons = arith.addi %arg1, %c1_i32 {ssbuffer.block_id = 7 : i32, ssbuffer.intraDeps = [0 : i32, 0 : i32]} : i32
+        scf.yield %cons : i32
+      } {ssbuffer.main_loop = 0 : i32}
+      scope.return
+    } {hivm.tcore_type = #hivm.tcore_type<VECTOR>}
+
+    scope.scope : () -> () {
+      %0 = scf.for %arg0 = %c0_i32 to %c16_i32 step %c1_i32
+          iter_args(%arg1 = %c0_i32) -> (i32) : i32 {
+        %prod = arith.addi %arg1, %c0_i32 {ssbuffer.block_id = 1 : i32, ssbuffer.intraDeps = [1 : i32, 1 : i32]} : i32
+        %cons = arith.addi %arg1, %c1_i32 {ssbuffer.block_id = 3 : i32, ssbuffer.intraDeps = [1 : i32, 0 : i32]} : i32
+        scf.yield %cons : i32
+      } {ssbuffer.main_loop = 0 : i32}
+      scope.return
+    } {hivm.tcore_type = #hivm.tcore_type<CUBE>}
+    return
   }
 }
