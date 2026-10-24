@@ -1,11 +1,11 @@
-// RUN: triton-opt --splitted-if-wrap-ssbuf-if %s --allow-unregistered-dialect | FileCheck %s
+// RUN: triton-opt --add-control-flow-condition %s --allow-unregistered-dialect | FileCheck %s
 
 // Reduced from acc-ys.mlir (before this pass) and acc.mlir (after).
 // One ssbuffer.if holds the tensor compute inside a single splitted_if, and
 // the while_arg update sits outside that splitted_if. A scalar ssbuffer.if
 // with no splitted_if stays unwrapped.
-// scf.for's else reads cntArgs filled by earlier control-flow passes, so this
-// standalone test uses scf.while.
+// SplittedIfWrapSsbufIf runs inside add-control-flow-condition. for's else
+// reads cntArgs filled by the earlier passes in that pipeline.
 
 // CHECK-LABEL: func.func @wrap_one_splitted_if
 // The split condition is hoisted above the new if.

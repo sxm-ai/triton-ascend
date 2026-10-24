@@ -54,7 +54,8 @@ using namespace CVPipeline;
 static constexpr int WRAP_SSBUF_IF_SUCCESS = 0;
 static constexpr int WRAP_SSBUF_IF_FAILED = -1;
 
-// Retarget uses of ssbufIf results outside the new if to the new if's results.
+// Retarget uses of ssbufIf's results that sit outside newIfOp to newIfOp's
+// results.
 static void replaceUsesOutsideNewIfOp(scf::IfOp ssbufIf, scf::IfOp newIfOp) {
   for (auto [innerRes, outerRes] :
        llvm::zip(ssbufIf.getResults(), newIfOp.getResults())) {
@@ -64,7 +65,7 @@ static void replaceUsesOutsideNewIfOp(scf::IfOp ssbufIf, scf::IfOp newIfOp) {
   }
 }
 
-// Replace the block terminator with scf.yield.
+// Replace block's terminator with scf.yield of operands.
 static void replaceTerminator(Block *block, Location loc, ValueRange operands) {
   if (block->mightHaveTerminator()) {
     block->getTerminator()->erase();
@@ -73,8 +74,9 @@ static void replaceTerminator(Block *block, Location loc, ValueRange operands) {
   builder.create<scf::YieldOp>(loc, operands);
 }
 
-// Splice the splitted_if then-body in front of it and erase the if.
-// The then terminator is scf.yield and its operands match the if results.
+// Move splittedIf's then body in front of splittedIf.
+// Retarget splittedIf's results to the then yield operands, then erase
+// splittedIf.
 static void unwrapSplittedIf(scf::IfOp splittedIf) {
   Block *thenBlock = splittedIf.thenBlock();
   auto thenYield = cast<scf::YieldOp>(thenBlock->getTerminator());
@@ -95,7 +97,8 @@ static void unwrapSplittedIf(scf::IfOp splittedIf) {
   splittedIf.erase();
 }
 
-// Order while_arg ops so defs come before uses.
+// Order chain so each def precedes its uses, and append that order to ordered.
+// Return FAILED when chain contains a cycle.
 static int orderWhileArgOps(ArrayRef<Operation *> chain,
                             SmallVector<Operation *> &ordered) {
   DenseSet<Operation *> pending(chain.begin(), chain.end());
@@ -131,9 +134,9 @@ static int orderWhileArgOps(ArrayRef<Operation *> chain,
   return WRAP_SSBUF_IF_SUCCESS;
 }
 
-// Clone while_arg ops that sit outside splittedIf into the new if's else.
-// An update inside splittedIf runs only on the split-true path, so the else
-// keeps the passthrough value.
+// Clone ssbufIf's while_arg ops that sit outside splittedIf into elseBlock.
+// Yield elsePassthrough, replacing a slot when the cloned ops produce that
+// then-yield value.
 static int buildWhileNewIfElse(scf::IfOp ssbufIf, scf::IfOp splittedIf,
                                Block *elseBlock,
                                ArrayRef<Value> elsePassthrough, Location loc) {
@@ -177,7 +180,8 @@ static int buildWhileNewIfElse(scf::IfOp ssbufIf, scf::IfOp splittedIf,
   return WRAP_SSBUF_IF_SUCCESS;
 }
 
-// Build the scf.for new-if else, replacing the block counter with counter+step.
+// Yield elsePassthrough from elseBlock.
+// Replace ssbufIf's recorded block counter with that counter plus forOp's step.
 static int buildForNewIfElse(scf::ForOp forOp, ControlFlowConditionInfo *info,
                              scf::IfOp ssbufIf, Block *elseBlock,
                              ArrayRef<Value> elsePassthrough, Location loc) {
@@ -221,8 +225,9 @@ static int buildForNewIfElse(scf::ForOp forOp, ControlFlowConditionInfo *info,
   return WRAP_SSBUF_IF_SUCCESS;
 }
 
-// Build the new if's else. for adds counter+step; while clones while_arg ops
-// that sit outside the splitted_if.
+// Fill elseBlock for loopOp from elsePassthrough.
+// for replaces ssbufIf's block counter. while clones while_arg ops outside
+// splittedIf.
 static int buildNewIfElse(Operation *loopOp, ControlFlowConditionInfo *info,
                           scf::IfOp ssbufIf, scf::IfOp splittedIf,
                           Block *elseBlock, ArrayRef<Value> elsePassthrough,
@@ -235,7 +240,8 @@ static int buildNewIfElse(Operation *loopOp, ControlFlowConditionInfo *info,
                              loc);
 }
 
-// First condition op already sitting before `before`, otherwise `before`.
+// Return the first op in condOps that already sits ahead of before. Otherwise
+// return before.
 static Operation *insertPointForCondOps(Operation *before,
                                         const DenseSet<Operation *> &condOps) {
   for (Operation &op : *before->getBlock()) {
@@ -249,7 +255,7 @@ static Operation *insertPointForCondOps(Operation *before,
   return before;
 }
 
-// True when every use of op moves with the chain or already sits inside the if.
+// Return true when every use of op is in ops or inside insertBefore.
 static bool opHasOnlyLocalUses(Operation *op, const DenseSet<Operation *> &ops,
                                Operation *insertBefore) {
   Block *destBlock = insertBefore->getBlock();
@@ -270,7 +276,8 @@ static bool opHasOnlyLocalUses(Operation *op, const DenseSet<Operation *> &ops,
   return true;
 }
 
-// Include annotation.mark ops that use a condition value.
+// Insert into ops each annotation.mark before anchor that uses a value defined
+// by ops.
 static void addSatelliteMarkOps(DenseSet<Operation *> &ops, Operation *anchor) {
   for (Operation &op : *anchor->getBlock()) {
     if (&op == anchor) {
@@ -289,8 +296,8 @@ static void addSatelliteMarkOps(DenseSet<Operation *> &ops, Operation *anchor) {
   }
 }
 
-// Collect the condition def-chain that already sits before anchor.
-// Iterative DFS. An op already in ops is not expanded again.
+// Insert into ops the def-chain of value that already sits in anchor's block,
+// before anchor.
 static void collectConditionDefOpsBefore(Value value, Operation *anchor,
                                          DenseSet<Operation *> &ops) {
   SmallVector<Value> worklist;
@@ -308,7 +315,8 @@ static void collectConditionDefOpsBefore(Value value, Operation *anchor,
   }
 }
 
-// Move the ssbuffer.if condition def-chain to just before `before`.
+// Move the def-chain of cond that sits before fromAnchor to just ahead of
+// before. Leave ops in stayOutside where they are.
 static void moveDefChainBefore(Value cond, Operation *fromAnchor,
                                Operation *before,
                                const DenseSet<Operation *> &stayOutside) {
@@ -371,7 +379,8 @@ static void moveDefChainBefore(Value cond, Operation *fromAnchor,
   }
 }
 
-// Wrap ssbufIf in a new if on the split condition.
+// Create newIfOp on splittedIf's condition, move ssbufIf into its then, and
+// pack ssbufIf's condition there.
 static void wrapSsbufIf(scf::IfOp ssbufIf, scf::IfOp splittedIf,
                         scf::IfOp &newIfOp) {
   Location loc = ssbufIf.getLoc();
@@ -398,8 +407,7 @@ static void wrapSsbufIf(scf::IfOp ssbufIf, scf::IfOp splittedIf,
                      ssbufIf.getOperation(), splitCondOps);
 }
 
-// Collect the condition def-chain defined inside ssbufIf.
-// Iterative DFS. An op already in ops is not expanded again.
+// Insert into ops the def-chain of value that is defined inside ssbufIf.
 static void collectConditionDefOpsInside(Value value, scf::IfOp ssbufIf,
                                          DenseSet<Operation *> &ops) {
   SmallVector<Value> worklist;
@@ -417,8 +425,8 @@ static void collectConditionDefOpsInside(Value value, scf::IfOp ssbufIf,
   }
 }
 
-// Hoist the splitted_if condition above ssbufIf. Its defs are direct ops in
-// the ssbuffer.if then.
+// Move the def-chain of splittedIf's condition that sits in ssbufIf's then to
+// just before ssbufIf.
 static void hoistSplittedIfCondition(scf::IfOp ssbufIf, scf::IfOp splittedIf) {
   DenseSet<Operation *> condOps;
   collectConditionDefOpsInside(splittedIf.getCondition(), ssbufIf, condOps);
@@ -436,7 +444,8 @@ static void hoistSplittedIfCondition(scf::IfOp ssbufIf, scf::IfOp splittedIf) {
   }
 }
 
-// Hoist the split condition and pack the ssbuffer.if condition against the if.
+// Hoist splittedIf's condition above ssbufIf, then pack ssbufIf's condition
+// against ssbufIf.
 static void hoistSplitCondAndPackSsbufCond(scf::IfOp ssbufIf,
                                            scf::IfOp splittedIf) {
   hoistSplittedIfCondition(ssbufIf, splittedIf);
@@ -448,7 +457,8 @@ static void hoistSplitCondAndPackSsbufCond(scf::IfOp ssbufIf,
                      ssbufIf.getOperation(), splitCondOps);
 }
 
-// Wrap one ssbuffer.if that has exactly one splitted_if.
+// Wrap ssbufIf in an if on splittedIf's condition inside loopOp.
+// for reads the block counter recorded for ssbufIf.
 static int splittedIfWrapSsbufIf(scf::IfOp ssbufIf, scf::IfOp splittedIf,
                                  Operation *loopOp,
                                  ControlFlowConditionInfo *info) {
@@ -472,7 +482,7 @@ static int splittedIfWrapSsbufIf(scf::IfOp ssbufIf, scf::IfOp splittedIf,
   return WRAP_SSBUF_IF_SUCCESS;
 }
 
-// True when ssbufIf contains a real tensor compute op.
+// Return true when ssbufIf contains a real tensor compute op.
 static bool ssbufIfHasTensorCompute(scf::IfOp ssbufIf) {
   WalkResult walk = ssbufIf->walk([&](Operation *op) {
     if (isRealTensorComputeOp(op)) {
@@ -485,7 +495,8 @@ static bool ssbufIfHasTensorCompute(scf::IfOp ssbufIf) {
   return walk.wasInterrupted();
 }
 
-// True when real tensor compute under ssbufIf stays in splittedIf's then.
+// Return true when every real tensor compute op under ssbufIf sits in
+// splittedIf's then.
 static bool computeOnlyInSplitThen(scf::IfOp ssbufIf, scf::IfOp splittedIf) {
   Block *thenBlock = splittedIf.thenBlock();
   WalkResult walk = ssbufIf->walk([&](Operation *op) {
@@ -501,8 +512,8 @@ static bool computeOnlyInSplitThen(scf::IfOp ssbufIf, scf::IfOp splittedIf) {
   return !walk.wasInterrupted();
 }
 
-// How many splitted_ifs are under ssbufIf. Stops after a second one.
-// splittedIf is set only when the count is exactly one.
+// Return how many splitted_if ops sit under ssbufIf. Stop after the second one.
+// Set splittedIf only when the count is one.
 static unsigned countSplittedIfs(scf::IfOp ssbufIf, scf::IfOp &splittedIf) {
   unsigned count = 0;
   scf::IfOp found;
@@ -523,8 +534,8 @@ static unsigned countSplittedIfs(scf::IfOp ssbufIf, scf::IfOp &splittedIf) {
   return count;
 }
 
-// Check whether wrap can proceed and fill loopToSsbufSplittedIf.
-// True means wrap can proceed.
+// Fill loopToSsbufSplittedIf with each main loop's ssbuffer.if and its
+// splitted_if. Return false when a loop fails a wrap restriction.
 static bool checkCanWrap(
     ModuleOp module,
     llvm::MapVector<Operation *, SmallVector<std::pair<scf::IfOp, scf::IfOp>>>
@@ -593,7 +604,8 @@ static bool checkCanWrap(
   return true;
 }
 
-// Check every restriction, then wrap the ssbuffer.ifs that passed.
+// Wrap each ssbuffer.if that checkCanWrap accepts. A wrap failure sets
+// ERRCODE_FAILED.
 void SplittedIfWrapSsbufIfPass::runOnOperation() {
   ModuleOp module = getOperation();
   LDBG("Before SplittedIfWrapSsbufIf:\n" << module << "\n");

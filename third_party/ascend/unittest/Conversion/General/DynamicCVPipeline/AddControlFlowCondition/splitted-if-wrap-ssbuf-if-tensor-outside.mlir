@@ -1,4 +1,4 @@
-// RUN: triton-opt --splitted-if-wrap-ssbuf-if %s --allow-unregistered-dialect | FileCheck %s --implicit-check-not=triton_ascend.dynamic_cv_pipeline.rc
+// RUN: triton-opt --add-control-flow-condition %s --allow-unregistered-dialect | FileCheck %s --implicit-check-not=triton_ascend.dynamic_cv_pipeline.rc
 
 // Tensor compute sits outside the splitted_if then. checkCanWrap rejects the
 // module before any rewrite.

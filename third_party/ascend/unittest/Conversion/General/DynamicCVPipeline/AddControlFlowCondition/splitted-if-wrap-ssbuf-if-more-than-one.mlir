@@ -1,4 +1,4 @@
-// RUN: triton-opt --splitted-if-wrap-ssbuf-if %s --allow-unregistered-dialect | FileCheck %s --implicit-check-not=triton_ascend.dynamic_cv_pipeline.rc
+// RUN: triton-opt --add-control-flow-condition %s --allow-unregistered-dialect | FileCheck %s --implicit-check-not=triton_ascend.dynamic_cv_pipeline.rc
 
 // One ssbuffer.if contains two splitted_ifs. checkCanWrap rejects the module
 // before any rewrite.
