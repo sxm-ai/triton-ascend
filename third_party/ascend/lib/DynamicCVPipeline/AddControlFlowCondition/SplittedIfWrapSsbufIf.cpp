@@ -513,7 +513,7 @@ static bool computeOnlyInSplitThen(scf::IfOp ssbufIf, scf::IfOp splittedIf) {
 }
 
 // Return how many splitted_if ops sit under ssbufIf. Stop after the second one.
-// Set splittedIf only when the count is one.
+// Set splittedIf when the count is one. Otherwise set splittedIf to null.
 static unsigned countSplittedIfs(scf::IfOp ssbufIf, scf::IfOp &splittedIf) {
   unsigned count = 0;
   scf::IfOp found;
@@ -541,24 +541,24 @@ static bool checkCanWrap(
     llvm::MapVector<Operation *, SmallVector<std::pair<scf::IfOp, scf::IfOp>>>
         &loopToSsbufSplittedIf) {
   IntegerAttr splittedIfId;
-  bool skipWrap = false;
-  module.walk([&](Operation *loopOp) -> WalkResult {
+  WalkResult loopWalk = module.walk([&](Operation *loopOp) -> WalkResult {
     if (!isMainLoopOp(loopOp)) {
       return WalkResult::advance();
     }
-    // (ssbuffer.if, its splitted_if) in this main loop. The splitted_if is
-    // null when that ssbuffer.if has none.
+    // ssbuffer.if sits directly in the main loop body. for uses getBody();
+    // while uses the after body. Nested ifs are not ops of this block.
+    Block *body = MainLoop(loopOp).getBody();
     SmallVector<std::pair<scf::IfOp, scf::IfOp>> ssbufIfs;
-    loopOp->walk([&](scf::IfOp ifOp) -> WalkResult {
-      if (!ifOp->hasAttr(kIf)) {
-        return WalkResult::advance();
+    for (Operation &op : body->without_terminator()) {
+      auto ifOp = dyn_cast<scf::IfOp>(op);
+      if (!ifOp || !ifOp->hasAttr(kIf)) {
+        continue;
       }
       scf::IfOp splittedIf;
       unsigned splittedIfCount = countSplittedIfs(ifOp, splittedIf);
       if (splittedIfCount > 1) {
         LDBG("Skip wrap: ssbuffer.if contains more than one splitted_if. if: "
              << ifOp << "\n");
-        skipWrap = true;
         return WalkResult::interrupt();
       }
       if (splittedIfCount == 1) {
@@ -568,33 +568,25 @@ static bool checkCanWrap(
         } else if (splittedIfId.getInt() != id.getInt()) {
           LDBG("Skip wrap: module has more than one splitted_if id. if: "
                << splittedIf << "\n");
-          skipWrap = true;
           return WalkResult::interrupt();
         }
         if (!computeOnlyInSplitThen(ifOp, splittedIf)) {
-          skipWrap = true;
           return WalkResult::interrupt();
         }
         ssbufIfs.push_back({ifOp, splittedIf});
-        return WalkResult::advance();
+        continue;
       }
       if (ssbufIfHasTensorCompute(ifOp)) {
         LDBG("Skip wrap: ssbuffer.if without splitted_if has tensor compute. "
              "if: "
              << ifOp << "\n");
-        skipWrap = true;
         return WalkResult::interrupt();
       }
-      ssbufIfs.push_back({ifOp, scf::IfOp()});
-      return WalkResult::advance();
-    });
-    if (skipWrap) {
-      return WalkResult::interrupt();
     }
     loopToSsbufSplittedIf.insert({loopOp, std::move(ssbufIfs)});
     return WalkResult::advance();
   });
-  if (skipWrap) {
+  if (loopWalk.wasInterrupted()) {
     return false;
   }
   if (!splittedIfId) {
@@ -613,23 +605,15 @@ void SplittedIfWrapSsbufIfPass::runOnOperation() {
     return;
   }
 
-  // Main loop -> (ssbuffer.if, its splitted_if). The splitted_if is null when
-  // that ssbuffer.if has none.
+  // Main loop -> (ssbuffer.if, its one splitted_if).
   llvm::MapVector<Operation *, SmallVector<std::pair<scf::IfOp, scf::IfOp>>>
       loopToSsbufSplittedIf;
   if (!checkCanWrap(module, loopToSsbufSplittedIf)) {
     return;
   }
 
-  bool stopWrap = false;
   for (auto &[loopOp, ssbufIfs] : loopToSsbufSplittedIf) {
-    if (stopWrap) {
-      break;
-    }
     for (auto [ssbufIf, splittedIf] : ssbufIfs) {
-      if (!splittedIf) {
-        continue;
-      }
       int wrapReturnCode =
           splittedIfWrapSsbufIf(ssbufIf, splittedIf, loopOp, info);
       if (wrapReturnCode == WRAP_SSBUF_IF_SUCCESS) {
@@ -637,8 +621,7 @@ void SplittedIfWrapSsbufIfPass::runOnOperation() {
       }
       LDBG("splittedIfWrapSsbufIf failed. if: " << ssbufIf << "\n");
       CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
-      stopWrap = true;
-      break;
+      return;
     }
   }
   LDBG("After SplittedIfWrapSsbufIf:\n" << module << "\n");
