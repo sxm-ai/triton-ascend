@@ -26,7 +26,7 @@ module {
         scf.yield %arg0 : i32
       } {ssbuffer.if = 2 : i32}
       scf.yield %2 : i32
-    } {ssbuffer.main_loop}
+    } attributes {ssbuffer.main_loop = 0 : i32}
     return
   }
 }
