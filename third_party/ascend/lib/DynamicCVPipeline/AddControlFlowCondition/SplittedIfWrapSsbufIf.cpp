@@ -54,229 +54,23 @@ using namespace CVPipeline;
 static constexpr int WRAP_SSBUF_IF_SUCCESS = 0;
 static constexpr int WRAP_SSBUF_IF_FAILED = -1;
 
-// How many splitted_ifs are under ssbufIf. Stops after a second one.
-// splittedIf is set only when the count is exactly one.
-static unsigned countSplittedIfs(scf::IfOp ssbufIf, scf::IfOp &splittedIf) {
-  unsigned count = 0;
-  scf::IfOp found;
-  ssbufIf.walk([&](scf::IfOp nested) {
-    if (nested == ssbufIf || !nested->hasAttr(kSplittedIf)) {
-      return WalkResult::advance();
-    }
-    if (count == 0) {
-      found = nested;
-    }
-    ++count;
-    if (count > 1) {
-      return WalkResult::interrupt();
-    }
-    return WalkResult::advance();
-  });
-  splittedIf = count == 1 ? found : scf::IfOp();
-  return count;
-}
-
-// True when ssbufIf contains a real tensor compute op.
-static bool ssbufIfHasTensorCompute(scf::IfOp ssbufIf) {
-  WalkResult walk = ssbufIf->walk([&](Operation *op) {
-    if (isRealTensorComputeOp(op)) {
-      LDBG("Tensor compute in ssbuffer.if without splitted_if: " << *op
-                                                                 << "\n");
-      return WalkResult::interrupt();
-    }
-    return WalkResult::advance();
-  });
-  return walk.wasInterrupted();
-}
-
-// True when real tensor compute under ssbufIf stays in splittedIf's then.
-static bool computeOnlyInSplitThen(scf::IfOp ssbufIf, scf::IfOp splittedIf) {
-  Block *thenBlock = splittedIf.thenBlock();
-  WalkResult walk = ssbufIf->walk([&](Operation *op) {
-    if (thenBlock->findAncestorOpInBlock(*op)) {
-      return WalkResult::skip();
-    }
-    if (isRealTensorComputeOp(op)) {
-      LDBG("Tensor compute outside the splitted_if then: " << *op << "\n");
-      return WalkResult::interrupt();
-    }
-    return WalkResult::advance();
-  });
-  return !walk.wasInterrupted();
-}
-
-// Collect the condition def-chain defined inside ssbufIf.
-// Iterative DFS. An op already in ops is not expanded again.
-static void collectConditionDefOpsInside(Value value, scf::IfOp ssbufIf,
-                                         DenseSet<Operation *> &ops) {
-  SmallVector<Value> worklist;
-  if (value) {
-    worklist.push_back(value);
-  }
-  while (!worklist.empty()) {
-    Value current = worklist.pop_back_val();
-    Operation *defOp = current.getDefiningOp();
-    if (!defOp || !ssbufIf->isProperAncestor(defOp) ||
-        !ops.insert(defOp).second) {
-      continue;
-    }
-    worklist.append(defOp->operand_begin(), defOp->operand_end());
+// Retarget uses of ssbufIf results outside the new if to the new if's results.
+static void replaceUsesOutsideNewIfOp(scf::IfOp ssbufIf, scf::IfOp newIfOp) {
+  for (auto [innerRes, outerRes] :
+       llvm::zip(ssbufIf.getResults(), newIfOp.getResults())) {
+    innerRes.replaceUsesWithIf(outerRes, [&](OpOperand &use) {
+      return !newIfOp->isProperAncestor(use.getOwner());
+    });
   }
 }
 
-// Hoist the splitted_if condition above ssbufIf. Its defs are direct ops in
-// the ssbuffer.if then.
-static void hoistSplittedIfCondition(scf::IfOp ssbufIf, scf::IfOp splittedIf) {
-  DenseSet<Operation *> condOps;
-  collectConditionDefOpsInside(splittedIf.getCondition(), ssbufIf, condOps);
-  if (condOps.empty()) {
-    return;
+// Replace the block terminator with scf.yield.
+static void replaceTerminator(Block *block, Location loc, ValueRange operands) {
+  if (block->mightHaveTerminator()) {
+    block->getTerminator()->erase();
   }
-  SmallVector<Operation *> sorted;
-  for (Operation &op : *ssbufIf.thenBlock()) {
-    if (condOps.contains(&op)) {
-      sorted.push_back(&op);
-    }
-  }
-  for (Operation *op : sorted) {
-    op->moveBefore(ssbufIf);
-  }
-}
-
-// Collect the condition def-chain that already sits before anchor.
-// Iterative DFS. An op already in ops is not expanded again.
-static void collectConditionDefOpsBefore(Value value, Operation *anchor,
-                                         DenseSet<Operation *> &ops) {
-  SmallVector<Value> worklist;
-  if (value) {
-    worklist.push_back(value);
-  }
-  while (!worklist.empty()) {
-    Value current = worklist.pop_back_val();
-    Operation *defOp = current.getDefiningOp();
-    if (!defOp || defOp->getBlock() != anchor->getBlock() ||
-        !defOp->isBeforeInBlock(anchor) || !ops.insert(defOp).second) {
-      continue;
-    }
-    worklist.append(defOp->operand_begin(), defOp->operand_end());
-  }
-}
-
-// Include annotation.mark ops that use a condition value.
-static void addSatelliteMarkOps(DenseSet<Operation *> &ops, Operation *anchor) {
-  for (Operation &op : *anchor->getBlock()) {
-    if (&op == anchor) {
-      break;
-    }
-    if (!isa<annotation::MarkOp>(&op)) {
-      continue;
-    }
-    for (Value operand : op.getOperands()) {
-      Operation *def = operand.getDefiningOp();
-      if (def && ops.contains(def)) {
-        ops.insert(&op);
-        break;
-      }
-    }
-  }
-}
-
-// True when every use of op moves with the chain or already sits inside the if.
-static bool opHasOnlyLocalUses(Operation *op, const DenseSet<Operation *> &ops,
-                               Operation *insertBefore) {
-  Block *destBlock = insertBefore->getBlock();
-  for (OpOperand &use : op->getUses()) {
-    Operation *user = use.getOwner();
-    if (ops.contains(user) || user == insertBefore) {
-      continue;
-    }
-    if (insertBefore->isProperAncestor(user)) {
-      continue;
-    }
-    if (op->getBlock() != destBlock && user->getBlock() == destBlock &&
-        user->isBeforeInBlock(insertBefore)) {
-      continue;
-    }
-    return false;
-  }
-  return true;
-}
-
-// First condition op already sitting before `before`, otherwise `before`.
-static Operation *insertPointForCondOps(Operation *before,
-                                        const DenseSet<Operation *> &condOps) {
-  for (Operation &op : *before->getBlock()) {
-    if (&op == before) {
-      break;
-    }
-    if (condOps.contains(&op)) {
-      return &op;
-    }
-  }
-  return before;
-}
-
-// Move the ssbuffer.if condition def-chain to just before `before`.
-static void moveDefChainBefore(Value cond, Operation *fromAnchor,
-                               Operation *before,
-                               const DenseSet<Operation *> &stayOutside) {
-  DenseSet<Operation *> condOps;
-  collectConditionDefOpsBefore(cond, fromAnchor, condOps);
-  if (condOps.empty()) {
-    return;
-  }
-  addSatelliteMarkOps(condOps, fromAnchor);
-
-  SmallVector<Operation *> sorted;
-  for (Operation &op : *fromAnchor->getBlock()) {
-    if (condOps.contains(&op)) {
-      sorted.push_back(&op);
-    }
-    if (&op == fromAnchor) {
-      break;
-    }
-  }
-
-  DenseSet<Operation *> moveSet;
-  for (Operation *op : sorted) {
-    if (stayOutside.contains(op)) {
-      continue;
-    }
-    if (opHasOnlyLocalUses(op, condOps, before)) {
-      moveSet.insert(op);
-    }
-  }
-
-  bool changed = true;
-  while (changed) {
-    changed = false;
-    for (Operation *op : sorted) {
-      if (!moveSet.contains(op)) {
-        continue;
-      }
-      for (OpOperand &use : op->getUses()) {
-        Operation *user = use.getOwner();
-        if (!condOps.contains(user) || moveSet.contains(user)) {
-          continue;
-        }
-        moveSet.erase(op);
-        changed = true;
-        break;
-      }
-    }
-  }
-
-  Operation *insertPt = before;
-  if (fromAnchor->getBlock() != before->getBlock()) {
-    insertPt = insertPointForCondOps(before, condOps);
-  }
-
-  for (Operation *op : sorted) {
-    if (!moveSet.contains(op) || op == insertPt) {
-      continue;
-    }
-    op->moveBefore(insertPt);
-  }
+  OpBuilder builder(block, block->end());
+  builder.create<scf::YieldOp>(loc, operands);
 }
 
 // Splice the splitted_if then-body in front of it and erase the if.
@@ -299,15 +93,6 @@ static void unwrapSplittedIf(scf::IfOp splittedIf) {
 
   splittedIf.replaceAllUsesWith(thenVals);
   splittedIf.erase();
-}
-
-// Replace the block terminator with scf.yield.
-static void replaceTerminator(Block *block, Location loc, ValueRange operands) {
-  if (block->mightHaveTerminator()) {
-    block->getTerminator()->erase();
-  }
-  OpBuilder builder(block, block->end());
-  builder.create<scf::YieldOp>(loc, operands);
 }
 
 // Order while_arg ops so defs come before uses.
@@ -450,16 +235,140 @@ static int buildNewIfElse(Operation *loopOp, ControlFlowConditionInfo *info,
                              loc);
 }
 
-// Hoist the split condition and pack the ssbuffer.if condition against the if.
-static void hoistSplitCondAndPackSsbufCond(scf::IfOp ssbufIf,
-                                           scf::IfOp splittedIf) {
-  hoistSplittedIfCondition(ssbufIf, splittedIf);
-  DenseSet<Operation *> splitCondOps;
-  collectConditionDefOpsBefore(splittedIf.getCondition(),
-                               ssbufIf.getOperation(), splitCondOps);
-  addSatelliteMarkOps(splitCondOps, ssbufIf.getOperation());
-  moveDefChainBefore(ssbufIf.getCondition(), ssbufIf.getOperation(),
-                     ssbufIf.getOperation(), splitCondOps);
+// First condition op already sitting before `before`, otherwise `before`.
+static Operation *insertPointForCondOps(Operation *before,
+                                        const DenseSet<Operation *> &condOps) {
+  for (Operation &op : *before->getBlock()) {
+    if (&op == before) {
+      break;
+    }
+    if (condOps.contains(&op)) {
+      return &op;
+    }
+  }
+  return before;
+}
+
+// True when every use of op moves with the chain or already sits inside the if.
+static bool opHasOnlyLocalUses(Operation *op, const DenseSet<Operation *> &ops,
+                               Operation *insertBefore) {
+  Block *destBlock = insertBefore->getBlock();
+  for (OpOperand &use : op->getUses()) {
+    Operation *user = use.getOwner();
+    if (ops.contains(user) || user == insertBefore) {
+      continue;
+    }
+    if (insertBefore->isProperAncestor(user)) {
+      continue;
+    }
+    if (op->getBlock() != destBlock && user->getBlock() == destBlock &&
+        user->isBeforeInBlock(insertBefore)) {
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+// Include annotation.mark ops that use a condition value.
+static void addSatelliteMarkOps(DenseSet<Operation *> &ops, Operation *anchor) {
+  for (Operation &op : *anchor->getBlock()) {
+    if (&op == anchor) {
+      break;
+    }
+    if (!isa<annotation::MarkOp>(&op)) {
+      continue;
+    }
+    for (Value operand : op.getOperands()) {
+      Operation *def = operand.getDefiningOp();
+      if (def && ops.contains(def)) {
+        ops.insert(&op);
+        break;
+      }
+    }
+  }
+}
+
+// Collect the condition def-chain that already sits before anchor.
+// Iterative DFS. An op already in ops is not expanded again.
+static void collectConditionDefOpsBefore(Value value, Operation *anchor,
+                                         DenseSet<Operation *> &ops) {
+  SmallVector<Value> worklist;
+  if (value) {
+    worklist.push_back(value);
+  }
+  while (!worklist.empty()) {
+    Value current = worklist.pop_back_val();
+    Operation *defOp = current.getDefiningOp();
+    if (!defOp || defOp->getBlock() != anchor->getBlock() ||
+        !defOp->isBeforeInBlock(anchor) || !ops.insert(defOp).second) {
+      continue;
+    }
+    worklist.append(defOp->operand_begin(), defOp->operand_end());
+  }
+}
+
+// Move the ssbuffer.if condition def-chain to just before `before`.
+static void moveDefChainBefore(Value cond, Operation *fromAnchor,
+                               Operation *before,
+                               const DenseSet<Operation *> &stayOutside) {
+  DenseSet<Operation *> condOps;
+  collectConditionDefOpsBefore(cond, fromAnchor, condOps);
+  if (condOps.empty()) {
+    return;
+  }
+  addSatelliteMarkOps(condOps, fromAnchor);
+
+  SmallVector<Operation *> sorted;
+  for (Operation &op : *fromAnchor->getBlock()) {
+    if (condOps.contains(&op)) {
+      sorted.push_back(&op);
+    }
+    if (&op == fromAnchor) {
+      break;
+    }
+  }
+
+  DenseSet<Operation *> moveSet;
+  for (Operation *op : sorted) {
+    if (stayOutside.contains(op)) {
+      continue;
+    }
+    if (opHasOnlyLocalUses(op, condOps, before)) {
+      moveSet.insert(op);
+    }
+  }
+
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (Operation *op : sorted) {
+      if (!moveSet.contains(op)) {
+        continue;
+      }
+      for (OpOperand &use : op->getUses()) {
+        Operation *user = use.getOwner();
+        if (!condOps.contains(user) || moveSet.contains(user)) {
+          continue;
+        }
+        moveSet.erase(op);
+        changed = true;
+        break;
+      }
+    }
+  }
+
+  Operation *insertPt = before;
+  if (fromAnchor->getBlock() != before->getBlock()) {
+    insertPt = insertPointForCondOps(before, condOps);
+  }
+
+  for (Operation *op : sorted) {
+    if (!moveSet.contains(op) || op == insertPt) {
+      continue;
+    }
+    op->moveBefore(insertPt);
+  }
 }
 
 // Wrap ssbufIf in a new if on the split condition.
@@ -473,8 +382,14 @@ static void wrapSsbufIf(scf::IfOp ssbufIf, scf::IfOp splittedIf,
                                 /*withElse=*/true);
   newIfOp->setAttr(kSplittedIf, splittedIf->getAttr(kSplittedIf));
 
+  // An scf.if with results is created without a yield. Put ssbufIf before the
+  // yield when one exists, otherwise at the end of the then block.
   Block *thenBlock = newIfOp.thenBlock();
-  ssbufIf->moveBefore(thenBlock->getTerminator());
+  if (thenBlock->mightHaveTerminator()) {
+    ssbufIf->moveBefore(thenBlock->getTerminator());
+  } else {
+    ssbufIf->moveBefore(thenBlock, thenBlock->end());
+  }
 
   DenseSet<Operation *> splitCondOps;
   collectConditionDefOpsBefore(splittedIf.getCondition(),
@@ -483,14 +398,54 @@ static void wrapSsbufIf(scf::IfOp ssbufIf, scf::IfOp splittedIf,
                      ssbufIf.getOperation(), splitCondOps);
 }
 
-// Retarget uses of ssbufIf results outside the new if to the new if's results.
-static void replaceUsesOutsideNewIfOp(scf::IfOp ssbufIf, scf::IfOp newIfOp) {
-  for (auto [innerRes, outerRes] :
-       llvm::zip(ssbufIf.getResults(), newIfOp.getResults())) {
-    innerRes.replaceUsesWithIf(outerRes, [&](OpOperand &use) {
-      return !newIfOp->isProperAncestor(use.getOwner());
-    });
+// Collect the condition def-chain defined inside ssbufIf.
+// Iterative DFS. An op already in ops is not expanded again.
+static void collectConditionDefOpsInside(Value value, scf::IfOp ssbufIf,
+                                         DenseSet<Operation *> &ops) {
+  SmallVector<Value> worklist;
+  if (value) {
+    worklist.push_back(value);
   }
+  while (!worklist.empty()) {
+    Value current = worklist.pop_back_val();
+    Operation *defOp = current.getDefiningOp();
+    if (!defOp || !ssbufIf->isProperAncestor(defOp) ||
+        !ops.insert(defOp).second) {
+      continue;
+    }
+    worklist.append(defOp->operand_begin(), defOp->operand_end());
+  }
+}
+
+// Hoist the splitted_if condition above ssbufIf. Its defs are direct ops in
+// the ssbuffer.if then.
+static void hoistSplittedIfCondition(scf::IfOp ssbufIf, scf::IfOp splittedIf) {
+  DenseSet<Operation *> condOps;
+  collectConditionDefOpsInside(splittedIf.getCondition(), ssbufIf, condOps);
+  if (condOps.empty()) {
+    return;
+  }
+  SmallVector<Operation *> sorted;
+  for (Operation &op : *ssbufIf.thenBlock()) {
+    if (condOps.contains(&op)) {
+      sorted.push_back(&op);
+    }
+  }
+  for (Operation *op : sorted) {
+    op->moveBefore(ssbufIf);
+  }
+}
+
+// Hoist the split condition and pack the ssbuffer.if condition against the if.
+static void hoistSplitCondAndPackSsbufCond(scf::IfOp ssbufIf,
+                                           scf::IfOp splittedIf) {
+  hoistSplittedIfCondition(ssbufIf, splittedIf);
+  DenseSet<Operation *> splitCondOps;
+  collectConditionDefOpsBefore(splittedIf.getCondition(),
+                               ssbufIf.getOperation(), splitCondOps);
+  addSatelliteMarkOps(splitCondOps, ssbufIf.getOperation());
+  moveDefChainBefore(ssbufIf.getCondition(), ssbufIf.getOperation(),
+                     ssbufIf.getOperation(), splitCondOps);
 }
 
 // Wrap one ssbuffer.if that has exactly one splitted_if.
@@ -515,6 +470,57 @@ static int splittedIfWrapSsbufIf(scf::IfOp ssbufIf, scf::IfOp splittedIf,
   replaceUsesOutsideNewIfOp(ssbufIf, newIfOp);
   LDBG("Wrapped ssbuffer.if with hoisted splitted_if. if: " << ssbufIf << "\n");
   return WRAP_SSBUF_IF_SUCCESS;
+}
+
+// True when ssbufIf contains a real tensor compute op.
+static bool ssbufIfHasTensorCompute(scf::IfOp ssbufIf) {
+  WalkResult walk = ssbufIf->walk([&](Operation *op) {
+    if (isRealTensorComputeOp(op)) {
+      LDBG("Tensor compute in ssbuffer.if without splitted_if: " << *op
+                                                                 << "\n");
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return walk.wasInterrupted();
+}
+
+// True when real tensor compute under ssbufIf stays in splittedIf's then.
+static bool computeOnlyInSplitThen(scf::IfOp ssbufIf, scf::IfOp splittedIf) {
+  Block *thenBlock = splittedIf.thenBlock();
+  WalkResult walk = ssbufIf->walk([&](Operation *op) {
+    if (thenBlock->findAncestorOpInBlock(*op)) {
+      return WalkResult::skip();
+    }
+    if (isRealTensorComputeOp(op)) {
+      LDBG("Tensor compute outside the splitted_if then: " << *op << "\n");
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return !walk.wasInterrupted();
+}
+
+// How many splitted_ifs are under ssbufIf. Stops after a second one.
+// splittedIf is set only when the count is exactly one.
+static unsigned countSplittedIfs(scf::IfOp ssbufIf, scf::IfOp &splittedIf) {
+  unsigned count = 0;
+  scf::IfOp found;
+  ssbufIf.walk([&](scf::IfOp nested) {
+    if (nested == ssbufIf || !nested->hasAttr(kSplittedIf)) {
+      return WalkResult::advance();
+    }
+    if (count == 0) {
+      found = nested;
+    }
+    ++count;
+    if (count > 1) {
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  splittedIf = count == 1 ? found : scf::IfOp();
+  return count;
 }
 
 // Check whether wrap can proceed and fill loopToSsbufSplittedIf.
