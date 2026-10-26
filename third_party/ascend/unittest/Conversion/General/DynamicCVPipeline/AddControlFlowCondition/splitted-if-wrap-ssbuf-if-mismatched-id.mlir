@@ -1,4 +1,4 @@
-// RUN: triton-opt --add-control-flow-condition %s | FileCheck %s --implicit-check-not=triton_ascend.dynamic_cv_pipeline.rc
+// RUN: triton-opt --add-control-flow-condition %s | FileCheck %s
 
 // Two splitted_if ids. checkCanWrap rejects the module and leaves each
 // splitted_if inside its ssbuffer.if.

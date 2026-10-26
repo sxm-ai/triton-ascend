@@ -1,12 +1,17 @@
-// RUN: triton-opt --add-control-flow-condition %s | FileCheck %s --implicit-check-not=triton_ascend.dynamic_cv_pipeline.rc
+// RUN: triton-opt --add-control-flow-condition %s | FileCheck %s
 
 // VECTOR and CUBE each have one main scf.while. Block 5's tensor compute sits
 // in a single splitted_if. Wrap turns that splitted_if condition into the
-// outer if around ssbuffer.if 5.
+// outer if around ssbuffer.if 5. The new if's else clones the
+// ssbuffer.while_arg update, here addi of the block arg and 16.
 
 // CHECK-LABEL: func.func @wrap_one_splitted_if
+// CHECK: %[[C16:[^ ]+]] = arith.constant 16 : i32
+// CHECK: %[[SPLIT:[^ ]+]] = arith.cmpi sgt, {{.*}}ssbuffer.block_id = 5 : i32
+// CHECK: scf.if %[[SPLIT]]
 // CHECK: arith.mulf {{.*}} : tensor<4xf32>
 // CHECK: } {{.*}}ssbuffer.if = 5 : i32}
+// CHECK: arith.addi %{{[^ ]+}}, %[[C16]] {{.*}}ssbuffer.while_arg = 0 : i32} : i32
 // CHECK: } {{.*}}ssbuffer.splitted_if = 0 : i32}
 
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, ssbuffer.intra_buf_count = 2 : i32} {

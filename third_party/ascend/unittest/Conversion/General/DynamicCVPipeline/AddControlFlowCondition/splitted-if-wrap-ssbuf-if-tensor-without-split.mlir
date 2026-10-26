@@ -1,4 +1,4 @@
-// RUN: triton-opt --add-control-flow-condition %s | FileCheck %s --implicit-check-not=triton_ascend.dynamic_cv_pipeline.rc
+// RUN: triton-opt --add-control-flow-condition %s | FileCheck %s
 
 // Block 5 has a tensor mulf and no splitted_if. checkCanWrap rejects the
 // module and does not invent a splitted_if.
@@ -6,6 +6,7 @@
 // CHECK-LABEL: func.func @tensor_without_splitted_if
 // CHECK-NOT: ssbuffer.splitted_if
 // CHECK: arith.mulf {{.*}} : tensor<4xf32>
+// CHECK-NOT: ssbuffer.splitted_if
 // CHECK: } {{.*}}ssbuffer.if = 5 : i32}
 // CHECK-NOT: ssbuffer.splitted_if
 

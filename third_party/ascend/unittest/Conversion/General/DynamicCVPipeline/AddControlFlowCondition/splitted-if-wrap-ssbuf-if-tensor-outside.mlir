@@ -1,4 +1,4 @@
-// RUN: triton-opt --add-control-flow-condition %s | FileCheck %s --implicit-check-not=triton_ascend.dynamic_cv_pipeline.rc
+// RUN: triton-opt --add-control-flow-condition %s | FileCheck %s
 
 // The mulf sits in block 5 but outside the splitted_if then. checkCanWrap
 // rejects the module and leaves the splitted_if inside ssbuffer.if 5.

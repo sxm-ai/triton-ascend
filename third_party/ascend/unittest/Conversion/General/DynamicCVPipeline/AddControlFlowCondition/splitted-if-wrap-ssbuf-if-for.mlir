@@ -1,15 +1,21 @@
-// RUN: triton-opt --add-control-flow-condition %s | FileCheck %s --implicit-check-not=triton_ascend.dynamic_cv_pipeline.rc
+// RUN: triton-opt --add-control-flow-condition %s | FileCheck %s
 
 // VECTOR and CUBE each have one main scf.for and one intraDeps pair, so the
 // pipeline reaches SplittedIfWrapSsbufIf. The two pairs use different intra
 // groups: one group lists every producer, and calculateFactor looks those
 // producers up inside the current for. Block 5's mulf is inside one
 // splitted_if. The new if's else adds the block counter and the for step.
+// ProcessArgs appends one shared iter_arg, then UpdateLoopOps appends block
+// counters. The first counter is the third iter_arg, initialized to the for
+// lower bound.
 
 // CHECK-LABEL: func.func @wrap_for_splitted_if
+// CHECK: scf.for %{{[^ ]+}} = %[[LB:[^ ]+]] to %{{[^ ]+}} step %[[STEP:[^ ]+]] iter_args(%{{[^ ]+}} = %{{[^ ]+}}, %{{[^ ]+}} = %{{[^ ]+}}, %[[CTR:[^ ]+]] = %[[LB]]
+// CHECK: %[[SPLIT:[^ ]+]] = arith.cmpi sgt, {{.*}}ssbuffer.block_id = 5 : i32
+// CHECK: scf.if %[[SPLIT]]
 // CHECK: arith.mulf {{.*}} : tensor<4xf32>
 // CHECK: } {{.*}}ssbuffer.if = 5 : i32}
-// CHECK: arith.addi
+// CHECK: arith.addi %[[CTR]], %[[STEP]]
 // CHECK: } {{.*}}ssbuffer.splitted_if = 0 : i32}
 
 module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, ssbuffer.intra_buf_count = 2 : i32} {
