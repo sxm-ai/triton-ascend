@@ -54,26 +54,6 @@ using namespace CVPipeline;
 static constexpr int WRAP_SSBUF_IF_SUCCESS = 0;
 static constexpr int WRAP_SSBUF_IF_FAILED = -1;
 
-// Retarget uses of ssbufIf's results that sit outside newIfOp to newIfOp's
-// results.
-static void replaceUsesOutsideNewIfOp(scf::IfOp ssbufIf, scf::IfOp newIfOp) {
-  for (auto [innerRes, outerRes] :
-       llvm::zip(ssbufIf.getResults(), newIfOp.getResults())) {
-    innerRes.replaceUsesWithIf(outerRes, [&](OpOperand &use) {
-      return !newIfOp->isProperAncestor(use.getOwner());
-    });
-  }
-}
-
-// Replace block's terminator with scf.yield of operands.
-static void replaceTerminator(Block *block, Location loc, ValueRange operands) {
-  if (block->mightHaveTerminator()) {
-    block->getTerminator()->erase();
-  }
-  OpBuilder builder(block, block->end());
-  builder.create<scf::YieldOp>(loc, operands);
-}
-
 // Move splittedIf's then body in front of splittedIf.
 // Retarget splittedIf's results to the then yield operands, then erase
 // splittedIf.
@@ -97,24 +77,32 @@ static void unwrapSplittedIf(scf::IfOp splittedIf) {
   splittedIf.erase();
 }
 
-// Clone ssbufIf then-block ops tagged ssbuffer.while_arg into elseBlock, in
-// block order. Yield elsePassthrough, replacing a slot when a cloned op
-// produces that then-yield value.
-static int buildWhileNewIfElse(scf::IfOp ssbufIf, Block *elseBlock,
-                               ArrayRef<Value> elsePassthrough, Location loc) {
-  auto thenYield = dyn_cast<scf::YieldOp>(ssbufIf.thenBlock()->getTerminator());
-  if (!thenYield || thenYield.getNumOperands() != elsePassthrough.size() ||
-      thenYield.getNumOperands() != ssbufIf.getNumResults()) {
-    LDBG("Failed to build while new-if else: then yield does not match. if: "
-         << ssbufIf << "\n");
-    return WRAP_SSBUF_IF_FAILED;
+// Record else-yield values that must be updated.
+// for maps the block counter to counter+step. while clones ssbuffer.while_arg
+// ops and maps each else operand to the clone of the then value in that slot.
+static int buildElseUpdate(Operation *loopOp, ControlFlowConditionInfo *info,
+                           scf::IfOp ssbufIf, OpBuilder &elseBuilder,
+                           ArrayRef<Value> elsePassthrough, Location loc,
+                           IRMapping &mapping) {
+  if (auto forOp = dyn_cast<scf::ForOp>(loopOp)) {
+    if (!info->cntArgs.count(ssbufIf)) {
+      LDBG("Failed to build for new-if else: ssbuffer.if has no cntArgs. if: "
+           << ssbufIf << "\n");
+      return WRAP_SSBUF_IF_FAILED;
+    }
+    Value counter = info->cntArgs[ssbufIf];
+    if (!counter) {
+      LDBG("Failed to build for new-if else: counter is null. if: " << ssbufIf
+                                                                    << "\n");
+      return WRAP_SSBUF_IF_FAILED;
+    }
+    Value inc =
+        elseBuilder.create<arith::AddIOp>(loc, counter, forOp.getStep());
+    mapping.map(counter, inc);
+    return WRAP_SSBUF_IF_SUCCESS;
   }
 
-  OpBuilder elseBuilder(elseBlock, elseBlock->end());
-  if (elseBlock->mightHaveTerminator()) {
-    elseBuilder.setInsertionPoint(elseBlock->getTerminator());
-  }
-  IRMapping mapping;
+  auto thenYield = cast<scf::YieldOp>(ssbufIf.thenBlock()->getTerminator());
   for (Operation &op : *ssbufIf.thenBlock()) {
     if (!op.hasAttr(kWhileArg)) {
       continue;
@@ -122,72 +110,50 @@ static int buildWhileNewIfElse(scf::IfOp ssbufIf, Block *elseBlock,
     Operation *cloned = elseBuilder.clone(op, mapping);
     elseBuilder.setInsertionPointAfter(cloned);
   }
-
-  SmallVector<Value> elseVals(elsePassthrough.begin(), elsePassthrough.end());
   for (auto [idx, thenVal] : llvm::enumerate(thenYield.getOperands())) {
-    if (mapping.contains(thenVal)) {
-      elseVals[idx] = mapping.lookup(thenVal);
+    if (!mapping.contains(thenVal)) {
+      continue;
     }
+    mapping.map(elsePassthrough[idx], mapping.lookup(thenVal));
   }
-  replaceTerminator(elseBlock, loc, elseVals);
   return WRAP_SSBUF_IF_SUCCESS;
 }
 
-// Yield elsePassthrough from elseBlock.
-// Replace ssbufIf's recorded block counter with that counter plus forOp's step.
-static int buildForNewIfElse(scf::ForOp forOp, ControlFlowConditionInfo *info,
-                             scf::IfOp ssbufIf, Block *elseBlock,
-                             ArrayRef<Value> elsePassthrough, Location loc) {
-  if (!info->cntArgs.count(ssbufIf)) {
-    LDBG("Failed to build for new-if else: ssbuffer.if has no cntArgs. if: "
-         << ssbufIf << "\n");
-    return WRAP_SSBUF_IF_FAILED;
-  }
-  Value counter = info->cntArgs[ssbufIf];
-  if (!counter) {
-    LDBG("Failed to build for new-if else: counter is null. if: " << ssbufIf
-         << "\n");
-    return WRAP_SSBUF_IF_FAILED;
-  }
-  Value step = forOp.getStep();
-
+// Fill elseBlock from elsePassthrough. An else operand in mapping is replaced
+// by the value just built in elseBlock.
+static int buildNewIfElse(Operation *loopOp, ControlFlowConditionInfo *info,
+                          scf::IfOp ssbufIf, Block *elseBlock,
+                          ArrayRef<Value> elsePassthrough, Location loc) {
   OpBuilder elseBuilder(elseBlock, elseBlock->end());
   if (elseBlock->mightHaveTerminator()) {
     elseBuilder.setInsertionPoint(elseBlock->getTerminator());
   }
-  Value inc = elseBuilder.create<arith::AddIOp>(loc, counter, step);
-  SmallVector<Value> elseVals(elsePassthrough.begin(), elsePassthrough.end());
-  bool replacedCounter = false;
-  for (Value &val : elseVals) {
-    if (val == counter) {
-      val = inc;
-      replacedCounter = true;
-    }
+
+  IRMapping mapping;
+  if (buildElseUpdate(loopOp, info, ssbufIf, elseBuilder, elsePassthrough, loc,
+                      mapping) != WRAP_SSBUF_IF_SUCCESS) {
+    return WRAP_SSBUF_IF_FAILED;
   }
-  if (!replacedCounter && !elseVals.empty() &&
-      elseVals.back().getType() == inc.getType()) {
-    elseVals.back() = inc;
+
+  SmallVector<Value> elseVals(elsePassthrough.begin(), elsePassthrough.end());
+  for (Value &val : elseVals) {
+    if (!mapping.contains(val)) {
+      continue;
+    }
+    val = mapping.lookup(val);
   }
   if (elseVals.size() != ssbufIf.getNumResults()) {
-    LDBG("Failed to build for new-if else: else value count "
+    LDBG("Failed to build new-if else: else value count "
          << elseVals.size() << ", results " << ssbufIf.getNumResults()
          << ". if: " << ssbufIf << "\n");
     return WRAP_SSBUF_IF_FAILED;
   }
-  replaceTerminator(elseBlock, loc, elseVals);
-  return WRAP_SSBUF_IF_SUCCESS;
-}
-
-// Fill elseBlock for loopOp from elsePassthrough.
-// for replaces ssbufIf's block counter. while clones ssbuffer.while_arg ops.
-static int buildNewIfElse(Operation *loopOp, ControlFlowConditionInfo *info,
-                          scf::IfOp ssbufIf, Block *elseBlock,
-                          ArrayRef<Value> elsePassthrough, Location loc) {
-  if (auto forOp = dyn_cast<scf::ForOp>(loopOp)) {
-    return buildForNewIfElse(forOp, info, ssbufIf, elseBlock, elsePassthrough,
-                             loc);
+  if (elseBlock->mightHaveTerminator()) {
+    elseBlock->getTerminator()->erase();
   }
-  return buildWhileNewIfElse(ssbufIf, elseBlock, elsePassthrough, loc);
+  OpBuilder yieldBuilder(elseBlock, elseBlock->end());
+  yieldBuilder.create<scf::YieldOp>(loc, elseVals);
+  return WRAP_SSBUF_IF_SUCCESS;
 }
 
 // Return the first op in condOps that already sits ahead of before. Otherwise
@@ -417,13 +383,25 @@ static int splittedIfWrapSsbufIf(scf::IfOp ssbufIf, scf::IfOp splittedIf,
   wrapSsbufIf(ssbufIf, splittedIf, newIfOp);
 
   Location loc = ssbufIf.getLoc();
-  if (buildNewIfElse(loopOp, info, ssbufIf, newIfOp.elseBlock(), elsePassthrough,
-                     loc) != WRAP_SSBUF_IF_SUCCESS) {
+  if (buildNewIfElse(loopOp, info, ssbufIf, newIfOp.elseBlock(),
+                     elsePassthrough, loc) != WRAP_SSBUF_IF_SUCCESS) {
     return WRAP_SSBUF_IF_FAILED;
   }
   unwrapSplittedIf(splittedIf);
-  replaceTerminator(newIfOp.thenBlock(), loc, ssbufIf.getResults());
-  replaceUsesOutsideNewIfOp(ssbufIf, newIfOp);
+  Block *thenBlock = newIfOp.thenBlock();
+  if (thenBlock->mightHaveTerminator()) {
+    thenBlock->getTerminator()->erase();
+  }
+  OpBuilder thenBuilder(thenBlock, thenBlock->end());
+  thenBuilder.create<scf::YieldOp>(loc, ssbufIf.getResults());
+  // Retarget uses of ssbufIf's results that sit outside newIfOp to newIfOp's
+  // results.
+  for (auto [innerRes, outerRes] :
+       llvm::zip(ssbufIf.getResults(), newIfOp.getResults())) {
+    innerRes.replaceUsesWithIf(outerRes, [&](OpOperand &use) {
+      return !newIfOp->isProperAncestor(use.getOwner());
+    });
+  }
   LDBG("Wrapped ssbuffer.if with hoisted splitted_if. if: " << ssbufIf << "\n");
   return WRAP_SSBUF_IF_SUCCESS;
 }
