@@ -199,7 +199,13 @@ private:
       Value &crossCoreCond);
 
   // Set the FlowOpt extra condition for the third if block in the DAG.
-  // Needs lb/ub/step from scf.for; scf.while leaves flowOptCond null.
+  // `currentIfOp` is the candidate target if. `loopOp` is the main loop that
+  // contains it. Only scf.for has lb/ub/step, so scf.while leaves
+  // `flowOptCond` null. `flowOptCond` receives the OR of the two counter
+  // compares, or null when flowopt is skipped.
+  // Skip when `currentIfOp` and its flowopt source are one tensor iter-arg
+  // producer/consumer pair on `loopOp`, in either role. That pair must run in
+  // the same iteration, and flowopt would delay the target to a later one.
   int setFlowOptCondition(scf::IfOp currentIfOp, Operation *loopOp,
                           Value &flowOptCond);
 

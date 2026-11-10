@@ -1197,7 +1197,31 @@ int UpdateConditionInfoPass::setIntraCoreCondition(
   return UPDATE_CONDITION_INFO_SUCCESS;
 }
 
-// Set the FlowOpt extra condition for the third if block in the DAG
+// Return true when `lhs` and `rhs` are one producer/consumer pair in any
+// tensor iter-arg relation of `loopOp`. Either if may be the producer.
+// `info` holds `tensorIterArgDepsMap`. A hit means the two ifs must run in
+// the same iteration, so flowopt must not delay one of them.
+static bool isTensorIterArgIfPair(ControlFlowConditionInfo *info,
+                                  Operation *loopOp, scf::IfOp lhs,
+                                  scf::IfOp rhs) {
+  auto depsIt = info->tensorIterArgDepsMap.find(loopOp);
+  if (depsIt == info->tensorIterArgDepsMap.end())
+    return false;
+
+  for (const TensorIterArgIfOpRelation &relation : depsIt->second) {
+    bool lhsIsProducer = relation.producer == lhs;
+    bool rhsIsProducer = relation.producer == rhs;
+    bool lhsIsConsumer = llvm::is_contained(relation.consumers, lhs);
+    bool rhsIsConsumer = llvm::is_contained(relation.consumers, rhs);
+    if ((lhsIsProducer && rhsIsConsumer) || (rhsIsProducer && lhsIsConsumer))
+      return true;
+  }
+  return false;
+}
+
+// Set the FlowOpt extra condition for the third if block in the DAG.
+// `currentIfOp` is the candidate target. `loopOp` is its main loop.
+// `flowOptCond` receives the OR condition, or null when flowopt is skipped.
 int UpdateConditionInfoPass::setFlowOptCondition(scf::IfOp currentIfOp,
                                                  Operation *loopOp,
                                                  Value &flowOptCond) {
@@ -1225,6 +1249,15 @@ int UpdateConditionInfoPass::setFlowOptCondition(scf::IfOp currentIfOp,
 
   // Get the start node
   scf::IfOp sourceIfOp = info->flowOptIfOpPairs[currentIfOp];
+  // Same-iteration tensor iter-arg pairs cannot also take a flowopt delay.
+  // Role does not matter: either if may be the producer.
+  if (isTensorIterArgIfPair(info, loopOp, sourceIfOp, currentIfOp)) {
+    LDBG("Flowopt pair is a tensor iter-arg pair, skip flowopt. currentIfOp="
+         << currentIfOp << ", sourceIfOp=" << sourceIfOp << ", loopOp="
+         << *loopOp << "\n");
+    flowOptCond = nullptr;
+    return UPDATE_CONDITION_INFO_SUCCESS;
+  }
   if (!info->cntArgs.count(sourceIfOp)) {
     LDBG("[Error] Start node has no counter in cntArgs, cannot build flowOpt "
          "condition. currentIfOp="
