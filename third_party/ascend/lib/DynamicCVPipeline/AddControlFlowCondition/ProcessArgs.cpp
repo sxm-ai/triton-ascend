@@ -156,6 +156,21 @@ static void collectChainOps(Operation *loopOp, Operation *compOp,
   }
 }
 
+// Result of `compOp` that the loop yield writes into iter arg `argIndex`.
+// Call before the body is migrated; the yield still sits in `body`.
+static unsigned yieldedResultNumber(Block *body, Operation *compOp,
+                                    unsigned argIndex) {
+  if (!body || !compOp || !body->mightHaveTerminator())
+    return 0;
+  auto yieldOp = dyn_cast<scf::YieldOp>(body->getTerminator());
+  if (!yieldOp || argIndex >= yieldOp.getNumOperands())
+    return 0;
+  auto result = dyn_cast<OpResult>(yieldOp.getOperand(argIndex));
+  if (!result || result.getOwner() != compOp)
+    return 0;
+  return result.getResultNumber();
+}
+
 // Builds compOp + chainOps for each shared arg. `body` is the loop body
 // (forOp body or whileOp after-body) used to locate scf.yield.
 static LogicalResult buildCompInfoForSharedArgs(
@@ -164,26 +179,38 @@ static LogicalResult buildCompInfoForSharedArgs(
     llvm::DenseMap<int, llvm::DenseSet<Operation *>> &sharedArgToChainOps) {
   for (auto &info : sharedArgsInfo) {
     int argIndex = info.argIndex;
-    if (sharedArgToCompOp.contains(argIndex))
-      continue;
-
-    Operation *compOp = findYieldDefiningOp(body, argIndex);
-    if (!compOp) {
-      continue;
+    Operation *compOp = nullptr;
+    if (sharedArgToCompOp.contains(argIndex)) {
+      compOp = sharedArgToCompOp.lookup(argIndex);
+    } else {
+      compOp = findYieldDefiningOp(body, argIndex);
+      if (!compOp)
+        continue;
+      sharedArgToCompOp[argIndex] = compOp;
+      llvm::DenseSet<Operation *> chainOps;
+      collectChainOps(loopOp, compOp, chainOps);
+      sharedArgToChainOps[argIndex] = chainOps;
     }
-
-    sharedArgToCompOp[argIndex] = compOp;
-
-    llvm::DenseSet<Operation *> chainOps;
-    collectChainOps(loopOp, compOp, chainOps);
-    sharedArgToChainOps[argIndex] = chainOps;
+    info.resultNumber = yieldedResultNumber(body, compOp, argIndex);
   }
   return success();
 }
 
+// Remap `from` when it is the iter arg being split or a result already cloned
+// in this chain. Direct operands only: nested uses are rewritten afterwards
+// by replaceIterArgsInBlock, one shared arg at a time.
+static Value remapChainOperand(Value from, IRMapping &argRemapping,
+                               IRMapping &resultMapper) {
+  if (argRemapping.contains(from))
+    return argRemapping.lookup(from);
+  if (resultMapper.contains(from))
+    return resultMapper.lookup(from);
+  return from;
+}
+
 // Clones the computation chain for a non-owner block (topo-sorted, operands
-// remapped). argRemapping: iter_arg -> new extra. clonedArgIdx: this block's
-// arg.
+// remapped). `argRemapping` maps this arg's iter_arg to its shadow.
+// Every result is recorded: a multi-result scf.if feeds several iter args.
 static LogicalResult
 cloneChainForBlock(SharedArgInfo &info, Operation *compOp,
                    const llvm::DenseSet<Operation *> &chainOps, Block *newBlock,
@@ -199,22 +226,13 @@ cloneChainForBlock(SharedArgInfo &info, Operation *compOp,
   }
 
   for (Operation *op : sortedChain) {
-    IRMapping opMapper;
-    for (OpOperand &operand : op->getOpOperands()) {
-      Value oldVal = operand.get();
-      Value newVal = oldVal;
-      if (argRemapping.contains(oldVal)) {
-        newVal = argRemapping.lookup(oldVal);
-      } else if (resultMapper.contains(oldVal)) {
-        // Operand is a result from earlier in the owner chain, use cloned
-        // result
-        newVal = resultMapper.lookup(oldVal);
-      }
-      opMapper.map(oldVal, newVal);
-    }
-
-    if (resultMapper.contains(op->getResult(0)))
+    if (op->getNumResults() != 0 && resultMapper.contains(op->getResult(0)))
       continue;
+
+    IRMapping opMapper;
+    for (Value operand : op->getOperands())
+      opMapper.map(operand,
+                   remapChainOperand(operand, argRemapping, resultMapper));
 
     Operation *cloned = cloneBuilder.clone(*op, opMapper);
     if (!cloned) {
@@ -226,7 +244,9 @@ cloneChainForBlock(SharedArgInfo &info, Operation *compOp,
     cloned->setAttr(CVPipeline::kArg,
                     cloneBuilder.getI32IntegerAttr(info.argIndex));
 
-    resultMapper.map(op->getResult(0), cloned->getResult(0));
+    for (auto [oldRes, newRes] :
+         llvm::zip(op->getResults(), cloned->getResults()))
+      resultMapper.map(oldRes, newRes);
     cloneBuilder.setInsertionPointAfter(cloned);
   }
   return success();
@@ -282,7 +302,8 @@ static LogicalResult processSharedArgsIteration(
     unsigned newExtraBlockArgIdx = extraIterArgsBase + info.newArgIndex;
     Value newExtraIterArg = newBlock->getArgument(newExtraBlockArgIdx);
 
-    // Build argRemapping: migratedIterArg -> newExtraIterArg
+    // Only this arg is remapped here. Other shared args are rewritten when
+    // their own iteration runs, including uses captured by earlier clones.
     IRMapping argRemapping;
     argRemapping.map(migratedIterArg, newExtraIterArg);
 
@@ -300,7 +321,8 @@ static LogicalResult processSharedArgsIteration(
     }
 
     IRMapping resultMapper;
-    if (failed(cloneChainForBlock(info, sharedArgToCompOp.lookup(argIndex),
+    Operation *compOp = sharedArgToCompOp.lookup(argIndex);
+    if (failed(cloneChainForBlock(info, compOp,
                                   sharedArgToChainOps.lookup(argIndex),
                                   newBlock, argRemapping, cloneBuilder,
                                   resultMapper, clonedArgIdx))) {
@@ -312,9 +334,15 @@ static LogicalResult processSharedArgsIteration(
       continue;
     }
 
-    Value clonedResult =
-        resultMapper.lookup(sharedArgToCompOp.lookup(argIndex)->getResult(0));
-    clonedResults.push_back(clonedResult);
+    unsigned resultNumber = info.resultNumber;
+    if (resultNumber >= compOp->getNumResults() ||
+        !resultMapper.contains(compOp->getResult(resultNumber))) {
+      LDBG("Missing cloned result " << resultNumber << " for iter arg "
+                                    << argIndex);
+      continue;
+    }
+    clonedResults.push_back(
+        resultMapper.lookup(compOp->getResult(resultNumber)));
     clonedArgIdx++;
   }
   return success();
@@ -637,7 +665,7 @@ static Operation *findLastOpWithBlockId(Block *body, int blockId) {
 // `body`. Annotates with ssbuffer.while_arg/block_id; remaps operands.
 static LogicalResult cloneUpdateChainForWhileBlock(
     scf::WhileOp whileOp, Block *body, Operation *compOp, int blockId,
-    unsigned originalArgIndex, unsigned newArgIndex,
+    unsigned originalArgIndex, unsigned newArgIndex, unsigned resultNumber,
     const llvm::DenseSet<Operation *> &chainOps, Value &cloned) {
   SmallVector<Operation *> sortedChain(chainOps.begin(), chainOps.end());
   if (failed(topologicalSort(sortedChain))) {
@@ -656,34 +684,38 @@ static LogicalResult cloneUpdateChainForWhileBlock(
 
   IRMapping resultMapper;
   for (Operation *op : sortedChain) {
-    IRMapping opMapper;
-    for (OpOperand &operand : op->getOpOperands()) {
-      Value oldVal = operand.get();
-      Value newVal = oldVal;
-      // Remap the original iter_arg to the new iter_arg for this block;
-      // chain-internal operands remap to the corresponding cloned value.
-      auto blockArg = dyn_cast<BlockArgument>(oldVal);
-      if (blockArg && blockArg.getOwner() == body &&
-          (unsigned)blockArg.getArgNumber() == originalArgIndex) {
-        newVal = body->getArgument(newArgIndex);
-      } else if (resultMapper.contains(oldVal)) {
-        newVal = resultMapper.lookup(oldVal);
-      }
-      opMapper.map(oldVal, newVal);
-    }
-
-    if (resultMapper.contains(op->getResult(0)))
+    if (op->getNumResults() != 0 && resultMapper.contains(op->getResult(0)))
       continue;
 
-    Operation *cloned = builder.clone(*op, opMapper);
-    cloned->setAttr(CVPipeline::kBlockId, builder.getI32IntegerAttr(blockId));
-    cloned->setAttr(CVPipeline::kWhileArg,
-                    builder.getI32IntegerAttr(originalArgIndex));
-    resultMapper.map(op->getResult(0), cloned->getResult(0));
-    builder.setInsertionPointAfter(cloned);
+    IRMapping opMapper;
+    for (Value operand : op->getOperands()) {
+      auto blockArg = dyn_cast<BlockArgument>(operand);
+      if (blockArg && blockArg.getOwner() == body &&
+          (unsigned)blockArg.getArgNumber() == originalArgIndex) {
+        opMapper.map(operand, body->getArgument(newArgIndex));
+      } else if (resultMapper.contains(operand)) {
+        opMapper.map(operand, resultMapper.lookup(operand));
+      }
+    }
+
+    Operation *clonedOp = builder.clone(*op, opMapper);
+    clonedOp->setAttr(CVPipeline::kBlockId, builder.getI32IntegerAttr(blockId));
+    clonedOp->setAttr(CVPipeline::kWhileArg,
+                      builder.getI32IntegerAttr(originalArgIndex));
+    for (auto [oldRes, newRes] :
+         llvm::zip(op->getResults(), clonedOp->getResults()))
+      resultMapper.map(oldRes, newRes);
+    builder.setInsertionPointAfter(clonedOp);
   }
 
-  cloned = resultMapper.lookup(compOp->getResult(0));
+  if (resultNumber >= compOp->getNumResults() ||
+      !resultMapper.contains(compOp->getResult(resultNumber))) {
+    cloned = Value();
+    LDBG("Missing cloned while result " << resultNumber << " for iter arg "
+                                        << originalArgIndex);
+    return failure();
+  }
+  cloned = resultMapper.lookup(compOp->getResult(resultNumber));
   return success();
 }
 
@@ -714,6 +746,8 @@ planWhileIterArgDescriptors(scf::WhileOp whileOp,
     collectChainOps(whileOp, compOp, chainOps);
     plan.compOp[origIdx] = compOp;
     plan.chainOps[origIdx] = chainOps;
+    plan.resultNumber[origIdx] =
+        yieldedResultNumber(whileOp.getAfterBody(), compOp, origIdx);
 
     for (int blockId : blockIdsInOrder) {
       plan.newArgDescriptors.push_back({blockId, nextNewArgIdx++, origIdx});
@@ -765,9 +799,9 @@ static LogicalResult cloneWhileBlockChains(scf::WhileOp newWhileOp,
     for (int blockId : blockIdsInOrder) {
       unsigned newArgIdx = blockOrigToNewArg.lookup({blockId, origIdx});
       Value cloned;
-      if (failed(cloneUpdateChainForWhileBlock(newWhileOp, newAfter, compOp,
-                                               blockId, origIdx, newArgIdx,
-                                               chainOps, cloned))) {
+      if (failed(cloneUpdateChainForWhileBlock(
+              newWhileOp, newAfter, compOp, blockId, origIdx, newArgIdx,
+              plan.resultNumber.lookup(origIdx), chainOps, cloned))) {
         return failure();
       }
       plan.clonedPerBlock[blockId][plan.posInClonedVec.lookup(origIdx)] =
