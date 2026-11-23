@@ -2623,6 +2623,47 @@ void InterCoreTransferAndSyncPass::getDependentDialects(
                   hivm::HIVMDialect, annotation::AnnotationDialect>();
 }
 
+// Two matmuls marked ssbuffer.loop_carried_l0c share one L0C accumulator.
+// The first result dies at fixpipe, so the next matmul is free to reuse that
+// accumulator. fixpipe reads it on PIPE_FIX while the next matmul writes it
+// on PIPE_M. Cross-core sync_block flags do not order those pipes, and ssbuf
+// disables bisheng auto block sync, so the second matmul can overwrite L0C
+// before fixpipe finishes. Insert one intra-core pair immediately before the
+// later matmul. The set is issued on PIPE_FIX after the earlier fixpipe; the
+// wait holds PIPE_M. EVENT_ID7 stays off the 0/1 ids used for M/MTE1 pairing.
+static void insertL0CFixpipeMatmulSync(ModuleOp module) {
+  SmallVector<linalg::MatmulOp> matmuls;
+  module.walk([&](linalg::MatmulOp matmul) {
+    if (matmul->hasAttr(CVPipeline::kLoopCarriedL0C))
+      matmuls.push_back(matmul);
+  });
+
+  MLIRContext *ctx = module.getContext();
+  OpBuilder builder(ctx);
+  auto setPipe = hivm::PipeAttr::get(ctx, hivm::PIPE::PIPE_FIX);
+  auto waitPipe = hivm::PipeAttr::get(ctx, hivm::PIPE::PIPE_M);
+  auto event = hivm::EventAttr::get(ctx, hivm::EVENT::EVENT_ID7);
+  for (linalg::MatmulOp matmul : matmuls) {
+    bool priorFixpipe = false;
+    for (Operation &op : *matmul->getBlock()) {
+      if (&op == matmul.getOperation())
+        break;
+      auto fixpipe = dyn_cast<hivm::FixpipeOp>(&op);
+      if (!fixpipe || fixpipe.getNumOperands() == 0)
+        continue;
+      auto producer = fixpipe.getOperand(0).getDefiningOp<linalg::MatmulOp>();
+      if (producer && producer->hasAttr(CVPipeline::kLoopCarriedL0C))
+        priorFixpipe = true;
+    }
+    if (!priorFixpipe)
+      continue;
+    builder.setInsertionPoint(matmul);
+    Location loc = matmul.getLoc();
+    builder.create<hivm::SetFlagOp>(loc, setPipe, waitPipe, event, Value{});
+    builder.create<hivm::WaitFlagOp>(loc, setPipe, waitPipe, event, Value{});
+  }
+}
+
 // Pass Entry Point
 void InterCoreTransferAndSyncPass::runOnOperation() {
   LOG_DEBUG("\n--- enter InterCoreTransferAndSyncPass --->\n");
@@ -2661,6 +2702,8 @@ void InterCoreTransferAndSyncPass::runOnOperation() {
     for (auto [source, normalized] : layouts)
       sinkOuterEventLayout(source, normalized);
   }
+
+  insertL0CFixpipeMatmulSync(module);
 
   LOG_DEBUG("Module after InterCoreTransferAndSyncPass:\n" << module << "\n");
 
